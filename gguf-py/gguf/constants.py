@@ -134,6 +134,7 @@ class Keys:
         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
         POST_NORM_EPS                     = "{arch}.post_norm_epsilon"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+        NEXTN_SHARED_TARGET_TENSORS       = "{arch}.nextn_shared_target_tensors"
         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
         DEEPSTACK_MAPPING                 = "{arch}.deepstack_mapping"
         POOLING_TYPE                      = "{arch}.pooling_type"
