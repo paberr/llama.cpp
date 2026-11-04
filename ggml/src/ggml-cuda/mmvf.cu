@@ -449,6 +449,11 @@ void launch_mul_mat_vec_f_cuda(
             block_size_best = block_size;
         }
     }
+    // RDNA3.5 APUs: a grid with fewer blocks than CUs (e.g. 4 rows x 10240) is latency bound, use wider blocks for long rows.
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc) && block_size_best == 256 &&
+            nrows*nchannels_dst*nsamples_or_ntokens < ggml_cuda_info().devices[device].nsm && ncols >= 2*1024*4) {
+        block_size_best = 1024;
+    }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
@@ -500,6 +505,12 @@ void launch_mul_mat_vec_f_cuda(
         } break;
         case  256: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
+                (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
+                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+        } break;
+        case 1024: {
+            mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 1024, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
