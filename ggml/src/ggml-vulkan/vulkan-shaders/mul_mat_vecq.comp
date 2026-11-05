@@ -131,7 +131,7 @@ void main() {
         compute_outputs(hc_first_row, NUM_ROWS);
     }
     return;
-#endif
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -147,4 +147,5 @@ void main() {
         }
         compute_outputs(first_row, p.stride_d - first_row);
     }
+#endif
 }

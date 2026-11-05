@@ -61,6 +61,7 @@ uint mat_vec_d_idx(const uint j, const uint row) {
 #ifdef HC_PRE_FUSION
 // DSV4_HC_PRE (gated) fused after the hc gate mat-vec: rows n = 0..NUM_ROWS-1 of this workgroup are the gate of stream n
 // of output element first_row. Same arithmetic as dsv4_hc_pre.comp (GATED): fma chain over the streams in order, then scale.
+const uint HC_STREAMS = 4; // the host pairs these shaders with NUM_ROWS == 4
 float hc_acc;
 void mat_vec_store(const uint j, const uint n, const uint first_row, const uint d_offset, const float g) {
     if (n == 0) {
@@ -68,7 +69,7 @@ void mat_vec_store(const uint j, const uint n, const uint first_row, const uint 
     }
     const float wv = 1.0f / (1.0f + exp(-g));
     hc_acc = fma(float(data_fuse0[j * p.hc_x_stride + first_row + n * p.hc_row_stride]), wv, hc_acc);
-    if (n == NUM_ROWS - 1) {
+    if (n == HC_STREAMS - 1) {
         data_d[d_offset + j * p.hc_d_stride + first_row] = D_TYPE(p.fuse_scale * hc_acc);
     }
 }

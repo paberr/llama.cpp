@@ -248,12 +248,12 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 void main() {
 #ifdef HC_PRE_FUSION
     // one output element per workgroup, its NUM_ROWS gate rows are hc_row_stride apart
-    const uint first_row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
-    if (first_row < p.hc_row_stride) {
-        compute_outputs(first_row, NUM_ROWS);
+    const uint hc_first_row = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+    if (hc_first_row < p.hc_row_stride) {
+        compute_outputs(hc_first_row, NUM_ROWS);
     }
     return;
-#endif
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
 #ifdef NEEDS_INIT_IQ_SHMEM
@@ -269,4 +269,5 @@ void main() {
         }
         compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
     }
+#endif
 }
