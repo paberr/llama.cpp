@@ -32,6 +32,10 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // fuse bit 0: s0 of sequence s is row data_ids[s] of the state cache bound as StateBuf (fused GET_ROWS)
+    // fuse bit 1: state snapshots go to CacheBuf, slot stride cache_slot_stride (fused CPY into the cache)
+    uint fuse;
+    uint cache_slot_stride;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -41,6 +45,16 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7)           buffer CacheBuf { FLOAT_TYPE data_cache[]; };
+layout(binding = 8) readonly  buffer IdsBuf   { int        data_ids[];   };
+
+void store_state(const uint slot, const uint idx, const FLOAT_TYPE v) {
+    if ((fuse & 2u) != 0u) {
+        data_cache[slot * cache_slot_stride + idx] = v;
+    } else {
+        data_dst[s_off + slot * (S_V * S_V * H * n_seqs) + idx] = v;
+    }
+}
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -103,7 +117,8 @@ void main() {
 
     const uint state_size = S_V * S_V;
     // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
-    const uint state_in_base       = (seq_id * H + head_id) * state_size;
+    const uint state_in_row        = (fuse & 1u) != 0u ? uint(data_ids[seq_id]) : seq_id;
+    const uint state_in_base       = (state_in_row * H + head_id) * state_size;
     // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
@@ -173,9 +188,8 @@ void main() {
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+                    store_state(uint(target_slot), state_out_base + col * S_V + r * LANES_PER_COLUMN + lane, s_shard[r]);
                 }
             }
         }
@@ -183,7 +197,7 @@ void main() {
 
     if (K == 1u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            store_state(0u, state_out_base + col * S_V + r * LANES_PER_COLUMN + lane, s_shard[r]);
         }
     }
 }

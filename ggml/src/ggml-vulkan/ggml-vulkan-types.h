@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -1251,6 +1252,17 @@ struct ggml_backend_vk_context {
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
+
+    // gated_delta_net fusions of the current graph (ggml_vk_find_gdn_fusions): the state GET_ROWS before it and the
+    // snapshot CPY after it are skipped, the gdn shader reads s0 from and writes its snapshots to the cache itself
+    struct gdn_fusion {
+        const ggml_tensor * states  = nullptr; // GET_ROWS src0: the state cache, s0 rows are read through ids
+        const ggml_tensor * ids     = nullptr; // GET_ROWS src1
+        const ggml_tensor * cache   = nullptr; // CPY dst: cache view the snapshots are written to
+        uint32_t            cache_slot_stride = 0;
+    };
+    std::unordered_map<const ggml_tensor *, gdn_fusion> gdn_fusions;
+    std::unordered_set<const ggml_tensor *> gdn_fused_skip; // GET_ROWS/CPY nodes done by a fused gdn
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),

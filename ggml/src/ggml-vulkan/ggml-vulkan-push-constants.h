@@ -705,6 +705,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t fuse;              // bit 0: s0 read from the cache through ids, bit 1: snapshots written to the cache
+    uint32_t cache_slot_stride; // elements between snapshot slots in the cache (fuse bit 1)
 };
 
 struct vk_op_ssm_scan_push_constants {
