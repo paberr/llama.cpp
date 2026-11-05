@@ -13,7 +13,8 @@ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 shared D_TYPE tile[32][33];
 
 void main() {
-    const uint t0 = gl_WorkGroupID.x * 32;
+    // param1: first tile along dim 0 (a conv input whose SSM_CONV reads the sources directly only writes its tail)
+    const uint t0 = (gl_WorkGroupID.x + uint(p.param1)) * 32;
     const uint c0 = gl_WorkGroupID.y * 32;
     const uint i2 = gl_WorkGroupID.z;
     const uint tx = gl_LocalInvocationID.x;

@@ -975,6 +975,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_cat_f32[3]; // ssm_conv / +silu / +bias+silu reading concat(state, transpose(x)) directly
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1265,6 +1266,10 @@ struct ggml_backend_vk_context {
     };
     std::unordered_map<const ggml_tensor *, gdn_fusion> gdn_fusions;
     std::unordered_set<const ggml_tensor *> gdn_fused_skip; // GET_ROWS/CPY nodes done by a fused gdn
+    // recurrent conv inputs concat(state, transpose(x)) (ggml_vk_find_conv_cat_fusions): the SSM_CONV reads state and x
+    // directly, the concat only writes the columns its other users (tail views) read, starting at this 32-column tile
+    std::unordered_map<const ggml_tensor *, uint32_t> conv_cat_tail_tile;
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> conv_cat_direct; // SSM_CONV node -> its concat
     std::vector<const ggml_tensor *> unsynced_nodes_read;
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),

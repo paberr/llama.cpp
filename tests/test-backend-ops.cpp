@@ -4785,6 +4785,74 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// recurrent conv input: CONCAT(state, transpose(x)) -> SSM_CONV (+ SILU), plus copies of tail column windows of the
+// concat into a state cache (the backend may read state and x directly and only materialise the tail)
+struct test_ssm_conv_cat : public test_case {
+    const int64_t d_conv;
+    const int64_t channels;
+    const int64_t n_t;
+    const int64_t n_tails; // tail windows, ending 0 .. n_tails-1 columns before the end
+    const bool    silu;
+    ggml_tensor * out      = nullptr;
+    std::vector<ggml_tensor *> tails;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = tails;
+        v.push_back(out);
+        return v;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(d_conv, channels, n_t, n_tails, silu);
+    }
+
+    test_ssm_conv_cat(int64_t d_conv = 4, int64_t channels = 256, int64_t n_t = 64, int64_t n_tails = 2, bool silu = true)
+        : d_conv(d_conv), channels(channels), n_t(n_t), n_tails(n_tails), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ns = d_conv - 1;
+        ggml_tensor * state  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ns, channels, 1);
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, n_t);
+        ggml_tensor * kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ns * channels, n_tails);
+        ggml_set_name(state, "state");
+        ggml_set_name(x, "x");
+        ggml_set_name(kernel, "kernel");
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * xt = ggml_reshape_3d(ctx, x, channels, n_t, 1);
+        ggml_tensor * cat = ggml_concat(ctx, state, ggml_transpose(ctx, xt), 0); // [ns + n_t, channels, 1]
+        ggml_set_name(cat, "conv_input");
+
+        out = ggml_ssm_conv(ctx, cat, kernel);
+        if (silu) {
+            out = ggml_silu(ctx, out);
+        }
+        ggml_set_name(out, "out");
+
+        for (int64_t s = 0; s < n_tails; ++s) {
+            const int64_t col = std::max<int64_t>(0, cat->ne[0] - ns - s);
+            ggml_tensor * tail = ggml_view_3d(ctx, cat, ns, channels, 1, cat->nb[1], cat->nb[2], ggml_row_size(cat->type, col));
+            ggml_tensor * dst  = ggml_view_2d(ctx, cache, ns * channels, 1, cache->nb[1], s * cache->nb[1]);
+            tails.push_back(ggml_cpy(ctx, tail, dst));
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11190,6 +11258,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
+    // recurrent conv input (concat of state and transposed x) feeding ssm_conv, with tail copies
+    for (int64_t n_t : {1, 5, 29, 33, 64, 100, 517}) {
+        for (int64_t channels : {64, 300}) {
+            test_cases.emplace_back(new test_ssm_conv_cat(4, channels, n_t, 3, true));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_cat(4, 256, 64, 1, false));
+    test_cases.emplace_back(new test_ssm_conv_cat(3, 256, 64, 2, true));
+    test_cases.emplace_back(new test_ssm_conv_cat(4, 10240, 2048, 3, true));
     for (int64_t d_conv : {3, 4, 7, 9}) {
         for (int64_t d_inner : {1024, 1536, 2048}) {
             for (bool fuse_bias : {false, true}) {
@@ -13287,6 +13364,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {937, 8192, 1, 1}, {4, 8192, 1, 1})); // prefill
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1})); // generate
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1}, true));  // prefill
+    test_cases.emplace_back(new test_ssm_conv_cat(4, 10240, 512, 3, true));  // qwen4exp gdn conv, prefill
     test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4,   3328, 1, 1}, {4, 3328, 1, 1}, true));  // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 512, 1)); // prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate

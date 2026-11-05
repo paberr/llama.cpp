@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// ssm_conv whose input is concat(state, transpose(x)) along dim 0 (the recurrent conv history of the current ubatch):
+// reads the state columns and x directly instead of the materialised concat, so x is read along its contiguous
+// channel axis. Same products and the same summation order as ssm_conv.comp.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
+layout(constant_id = 2) const bool APPLY_BIAS = false;
+layout(constant_id = 3) const bool APPLY_SILU = false;
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer State { float st[]; };
+layout(binding = 1) readonly buffer Src1 { float src1[]; };
+layout(binding = 2) readonly buffer Bias { float bias[]; };
+layout(binding = 3) writeonly buffer Dst { float dst[]; };
+layout(binding = 4) readonly buffer X { float xs[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ns;                        // state columns (the concat's src0 ne0)
+    uint st_nb1; uint st_nb2;       // state strides (elements), nb0 == 1
+    uint x_nb0; uint x_nb1; uint x_nb2; // the concat's src1 (transposed x): token, channel, sequence strides (elements)
+    uint nb11;                      // conv kernel row stride (bytes)
+    uint dst_nb1; uint dst_nb2;     // dst strides (bytes), nb0 == 4
+    uint nc; uint nr; uint n_t; uint n_s;
+    uint st_off; uint x_off; uint d_off; // misalignment of the bound ranges (elements)
+};
+
+// element j of the conv history of channel c, sequence s
+float conv_in(const uint c, const uint j, const uint s) {
+    return j < ns ? st[st_off + s * st_nb2 + c * st_nb1 + j]
+                  : xs[x_off + s * x_nb2 + c * x_nb1 + (j - ns) * x_nb0];
+}
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint i2 = gl_WorkGroupID.y * TOKENS_PER_WG + gl_LocalInvocationID.y;
+    const uint i3 = gl_WorkGroupID.z;
+
+    if (i1 >= nr || i2 >= n_t || i3 >= n_s) {
+        return;
+    }
+
+    const uint src1_base = i1 * (nb11 / 4);
+
+    float sum = 0.0;
+
+    if (nc == 4) {
+        sum = dot(
+            vec4(conv_in(i1, i2, i3), conv_in(i1, i2 + 1, i3), conv_in(i1, i2 + 2, i3), conv_in(i1, i2 + 3, i3)),
+            vec4(src1[src1_base], src1[src1_base + 1], src1[src1_base + 2], src1[src1_base + 3])
+        );
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            sum += conv_in(i1, i2 + i0, i3) * src1[src1_base + i0];
+        }
+    }
+
+    if (APPLY_BIAS) {
+        sum += bias[i1];
+    }
+    if (APPLY_SILU) {
+        sum = sum / (1.0f + exp(-sum));
+    }
+
+    const uint dst_idx = d_off + i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+    dst[dst_idx] = sum;
+}

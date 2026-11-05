@@ -726,6 +726,17 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// ssm_conv reading concat(state, transpose(x)) directly (ssm_conv_cat.comp)
+struct vk_op_ssm_conv_cat_push_constants {
+    uint32_t ns;
+    uint32_t st_nb1, st_nb2;
+    uint32_t x_nb0, x_nb1, x_nb2;
+    uint32_t nb11;
+    uint32_t dst_nb1, dst_nb2;
+    uint32_t nc, nr, n_t, n_s;
+    uint32_t st_off, x_off, d_off;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
