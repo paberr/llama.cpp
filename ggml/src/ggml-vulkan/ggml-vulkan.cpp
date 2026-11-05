@@ -13961,7 +13961,9 @@ static int ggml_vk_can_fuse_mmv_hc_pre(const ggml_backend_vk_context * ctx, cons
         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mm) ||
         !ggml_is_contiguous(x) || !ggml_is_contiguous(pre) ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-        mm->ne[1] < 1 || mm->ne[1] > mul_mat_vec_max_cols ||
+        // single-token decode only: with more columns the 4-row workgroups (one per output element, k = n_lo)
+        // are slower than the separate mat-vec + DSV4_HC_PRE (MTP verify shape n=3: 26.3 vs 23 us per site)
+        mm->ne[1] != 1 ||
         x->ne[1] != 4 || mm->ne[0] != 4 * n_embd || x->ne[2] != mm->ne[1] || x->ne[3] != 1 ||
         pre->ne[0] != n_embd || pre->ne[1] != mm->ne[1] ||
         get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pre) != 0 ||
