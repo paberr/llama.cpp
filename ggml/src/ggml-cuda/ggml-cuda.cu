@@ -2252,6 +2252,36 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
+    // AMD: a few-row F32 matrix times many columns (e.g. the 4 x 10240 hyper-connection inject at prompt processing) wastes
+    // nearly all of a BLAS tile. Compute the transposed product with the vector kernel instead (src1 as the matrix, the
+    // ne01 <= 8 rows of src0 as vectors) and transpose the small result into dst.
+    if (GGML_CUDA_CC_IS_AMD(cc) && ne01 > 1 && ne01 <= MMVF_MAX_BATCH_SIZE && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1
+            && src0->type == GGML_TYPE_F32
+            && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)
+            && ggml_cuda_should_use_mmvf(src1->type, cc, warp_size, src1->ne, src1->nb, /*ne11 =*/ ne01)) {
+        ggml_cuda_pool_alloc<float> tmp(ctx.pool(), ne11*ne01);
+
+        ggml_tensor dst_t = *dst; // [ne11, ne01]: row j holds src0 row j dotted with every src1 column
+        dst_t.data  = tmp.get();
+        dst_t.ne[0] = ne11;
+        dst_t.ne[1] = ne01;
+        dst_t.nb[1] = dst_t.nb[0]*ne11;
+        dst_t.nb[2] = dst_t.nb[1]*ne01;
+        dst_t.nb[3] = dst_t.nb[2];
+        ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_t);
+
+        ggml_tensor tmp_view = dst_t; // the same data seen as [ne01, ne11], i.e. transposed into dst's layout
+        tmp_view.ne[0] = ne01;
+        tmp_view.ne[1] = ne11;
+        tmp_view.nb[0] = dst_t.nb[1];
+        tmp_view.nb[1] = dst_t.nb[0];
+        tmp_view.nb[2] = dst_t.nb[0]*ne11*ne01;
+        tmp_view.nb[3] = tmp_view.nb[2];
+        tmp_view.op = GGML_OP_NONE;
+        tmp_view.view_src = nullptr;
+        ggml_cuda_cpy(ctx, &tmp_view, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
