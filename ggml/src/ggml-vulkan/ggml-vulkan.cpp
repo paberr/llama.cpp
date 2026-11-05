@@ -15090,6 +15090,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_mmv_hc_post = true;
                 fusion_string = "MUL_MAT_HC_POST";
                 std::fill_n(op_srcs_fused_elementwise, 5, false);
+                // The residual is read and the output written at the same element by the same invocation, so the
+                // output may reuse the residual's memory (the allocator does this in the recurrent layers).
+                {
+                    const ggml_tensor * post = cgraph->nodes[i + 4];
+                    const ggml_tensor * res  = post->src[1];
+                    op_srcs_fused_elementwise[4] = res->nb[1] == post->nb[1] && res->nb[2] == post->nb[2];
+                }
             } else if (ggml_vk_can_fuse_mmv_hc_pre(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_mmv_hc_pre = true;
@@ -15533,6 +15540,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // op sequence plus data flow: an inject mat-vec followed by the gate chain spells the same ops as the block
+        // output projection, but only the latter is fused
+        auto const &match_hc_chain = [&](const std::initializer_list<ggml_op> &pattern, int start) -> bool {
+            if (!match_pattern(pattern, start)) {
+                return false;
+            }
+            ggml_tensor * const * n = graph->nodes + start;
+            if (&pattern == &hc_mix_pattern) {
+                return n[1]->src[0] == n[0] && n[2]->src[0] == n[1] && n[3]->src[1] == n[2] &&
+                       n[4]->src[0] == n[3] && n[5]->src[1] == n[4];
+            }
+            return n[2]->src[0] == n[1] && n[3]->src[0] == n[2] && n[4]->src[0] == n[0] && n[4]->src[2] == n[3];
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -15616,6 +15637,49 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (match_hc_chain(hc_mix_pattern, first_unused)) {
+            add_pattern_alloc_deps(hc_mix_pattern, first_unused + (int) hc_mix_pattern.size() - 1);
+            keep_pattern(hc_mix_pattern);
+            continue;
+        }
+        // recurrent layers build the post-gate inject mat-vec between the output projection and its gate chain:
+        // emit it first (it only reads the block input), then the contiguous chain
+        if (first_unused + 5 < graph->n_nodes && !used[first_unused + 1] && graph->nodes[first_unused]->op == GGML_OP_MUL_MAT &&
+            graph->nodes[first_unused + 1]->op == GGML_OP_MUL_MAT && !is_src_of(graph->nodes[first_unused + 1], graph->nodes[first_unused])) {
+            ggml_tensor ** n = graph->nodes + first_unused;
+            bool ok = n[2]->op == GGML_OP_SCALE && n[3]->op == GGML_OP_UNARY && n[4]->op == GGML_OP_SCALE &&
+                      n[5]->op == GGML_OP_DSV4_HC_POST && n[2]->src[0] == n[1] && n[3]->src[0] == n[2] && n[4]->src[0] == n[3] &&
+                      n[5]->src[0] == n[0] && n[5]->src[2] == n[4];
+            for (int k = 2; ok && k <= 5; ++k) {
+                ok = !used[first_unused + k];
+            }
+            if (ok) {
+                std::set<ggml_tensor *> seen;
+                for (int k : { 0, 2, 3, 4, 5 }) {
+                    for (uint32_t si = 0; si < GGML_MAX_SRC; ++si) {
+                        ggml_tensor * src = n[k]->src[si];
+                        if (src && seen.insert(src).second) {
+                            params->add_alloc_dep(params->user_data, src, n[5]);
+                        }
+                    }
+                    seen.insert(n[k]);
+                }
+                for (int k : { 1, 0, 2, 3, 4, 5 }) {
+                    new_order.push_back(n[k]);
+                    used_node_set.insert(n[k]);
+                    used[first_unused + k] = true;
+                }
+                while (first_unused < graph->n_nodes && used[first_unused]) {
+                    first_unused++;
+                }
+                continue;
+            }
+        }
+        if (match_hc_chain(hc_combine_pattern, first_unused)) {
+            add_pattern_alloc_deps(hc_combine_pattern, first_unused + (int) hc_combine_pattern.size() - 1);
+            keep_pattern(hc_combine_pattern);
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15661,7 +15725,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                match_hc_chain(hc_mix_pattern, j) ||
+                match_hc_chain(hc_combine_pattern, j)) {
                 continue;
             }
             bool ok = true;
@@ -15842,6 +15908,35 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             first_unused++;
         }
     }
+    // The fused hyper-connection mat-vecs (MUL_MAT_SCALE_SILU + MUL_MAT_HC_PRE, MUL_MAT_HC_POST) read inputs of
+    // every node of the chain in one dispatch, so none of them may be freed (and reused for the chain output)
+    // before the chain ends. Done on the final order since the chains can be formed by any of the paths above.
+    for (int i = 0; i + 4 < graph->n_nodes; ++i) {
+        ggml_tensor * const * n = new_order.data() + i;
+        int len = 0;
+        if (i + 5 < graph->n_nodes && n[0]->op == GGML_OP_MUL_MAT && n[1]->op == GGML_OP_SCALE && n[2]->op == GGML_OP_UNARY &&
+            n[3]->op == GGML_OP_MUL_MAT && n[4]->op == GGML_OP_RESHAPE && n[5]->op == GGML_OP_DSV4_HC_PRE &&
+            n[1]->src[0] == n[0] && n[2]->src[0] == n[1] && n[3]->src[1] == n[2] && n[4]->src[0] == n[3] && n[5]->src[1] == n[4]) {
+            len = 6;
+        } else if (n[0]->op == GGML_OP_MUL_MAT && n[1]->op == GGML_OP_SCALE && n[2]->op == GGML_OP_UNARY &&
+                   n[3]->op == GGML_OP_SCALE && n[4]->op == GGML_OP_DSV4_HC_POST &&
+                   n[2]->src[0] == n[1] && n[3]->src[0] == n[2] && n[4]->src[0] == n[0] && n[4]->src[2] == n[3]) {
+            len = 5;
+        }
+        if (len == 0) {
+            continue;
+        }
+        for (int k = 0; k < len - 1; ++k) {
+            for (uint32_t si = 0; si < GGML_MAX_SRC; ++si) {
+                if (n[k]->src[si]) {
+                    params->add_alloc_dep(params->user_data, n[k]->src[si], n[len - 1]);
+                }
+            }
+            params->add_alloc_dep(params->user_data, n[k], n[len - 1]);
+        }
+        i += len - 1;
+    }
+
     // Replace the graph with the new order.
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];

@@ -541,6 +541,10 @@ static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGM
 
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+// hyper-connection chains fused into the mat-vec (MUL_MAT_SCALE_SILU + MUL_MAT_HC_PRE, MUL_MAT_HC_POST);
+// graph_optimize keeps them contiguous so independent nodes are not interleaved
+static constexpr std::initializer_list<ggml_op> hc_mix_pattern { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE };
+static constexpr std::initializer_list<ggml_op> hc_combine_pattern { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
 static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 1, 0, 0 }, // sigmoid->src[0] == scale

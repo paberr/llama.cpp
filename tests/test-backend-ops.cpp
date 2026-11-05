@@ -7891,6 +7891,9 @@ struct test_hc_mix : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    // quantized mat-vecs (q8_1 activations on the GPU), same tolerance as test_mul_mat
+    double max_nmse_err() override { return 5e-4; }
+
     std::string vars() override {
         return VARS_TO_STR4(type, n_embd, n_lo, n_tokens);
     }
@@ -7932,6 +7935,9 @@ struct test_hc_combine : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+
+    // quantized mat-vecs (q8_1 activations on the GPU), same tolerance as test_mul_mat
+    double max_nmse_err() override { return 5e-4; }
 
     std::string vars() override {
         return VARS_TO_STR4(type, n_embd, k, n_tokens);
