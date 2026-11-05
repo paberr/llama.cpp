@@ -4043,6 +4043,55 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// A GET_ROWS that gathers the recurrent state of a single sequence for one GATED_DELTA_NET (decode and short
+// verify batches) is skipped: the gdn kernel reads s0 from the cache row through the ids instead, which saves a full
+// read + write of the state. Its other users may only be views and empty copies (the extra-states copy of a
+// single-sequence ubatch is empty). The cache row may be updated in place: each gdn thread reads its part of s0
+// before it writes the same elements (gated_delta_net.cu).
+static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gr->src[0]->type != GGML_TYPE_F32 || gr->src[1]->type != GGML_TYPE_I32 ||
+        gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || !ggml_is_contiguous(gr) ||
+        gr->src[0]->nb[0] != sizeof(float) || gr->src[0]->nb[1] != gr->nb[1] || gr->src[0]->data == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * gdn = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr || (src != gr && src->view_src != gr)) {
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(n) && n->view_src == gr) {
+                continue; // a view of the gathered state, its users are checked through view_src
+            }
+            if (ggml_is_empty(n)) {
+                continue;
+            }
+            if (n->op == GGML_OP_GATED_DELTA_NET && s == 5 && gdn == nullptr && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                gdn = n;
+                continue;
+            }
+            return false;
+        }
+    }
+    if (gdn == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * v = gdn->src[2];
+    if (v->ne[3] != 1 || v->ne[2] >= 64 || gdn->src[5]->type != GGML_TYPE_F32 ||
+        ggml_nelements(gdn->src[5]) != gr->ne[0] || !ggml_is_contiguous(gdn->src[5])) {
+        return false; // one sequence, short batches (the batched mma path reads s0 as a tensor)
+    }
+
+    cuda_ctx->gdn_state_gathers.push_back({ gr, (const float *) gr->src[0]->data, (const int32_t *) gr->src[1]->data });
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4854,6 +4903,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    cuda_ctx->gdn_state_gathers.clear();
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5006,6 +5056,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (!ggml_cuda_fusion_disabled() && ggml_cuda_try_defer_gdn_state_gather(cuda_ctx, cgraph, i)) {
                     continue;
                 }
 
