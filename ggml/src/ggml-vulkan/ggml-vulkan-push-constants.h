@@ -30,6 +30,15 @@ struct vk_mat_vec_push_constants {
     uint32_t broadcast2;
     uint32_t broadcast3;
     uint32_t d_row_stride; // MAT_VEC_FLAGS_TRANSPOSE_D
+    float fuse_scale;   // MAT_VEC_FUSION_FLAGS_SCALE_SILU, HC_PRE_FUSION: the hc_pre scale
+    float fuse_bias;
+    uint32_t hc_row_stride; // HC_PRE_FUSION shaders: gate rows of one output element are this far apart (n_embd)
+    uint32_t hc_x_stride;   // HC_PRE_FUSION: token stride of the normed streams
+    uint32_t hc_d_stride;   // HC_PRE_FUSION: token stride of the mixed output; HC_POST: token stride of dst
+    uint32_t hc_r_stream;   // MAT_VEC_FUSION_FLAGS_HC_POST: residual stream stride (its token stride is hc_x_stride)
+    uint32_t hc_d_stream;   // HC_POST: dst stream stride
+    uint32_t hc_p_stream;   // HC_POST: gate input stream stride
+    uint32_t hc_p_token;    // HC_POST: gate input token stride
 };
 
 struct vk_mat_vec_p021_push_constants {

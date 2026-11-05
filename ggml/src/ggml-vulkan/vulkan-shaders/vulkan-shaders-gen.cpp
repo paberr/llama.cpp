@@ -812,6 +812,20 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        // dense mat-vec with the gated DSV4_HC_PRE fused after it (hyper-connection gate, Q8_0)
+        if (tname == "q8_0") {
+            const std::map<std::string, std::string> hc_dict = merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"HC_PRE_FUSION", "1"}});
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_f32_f32", shader, hc_dict);
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_f32_f32_subgroup", shader, merge_maps(hc_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(hc_dict, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            const std::map<std::string, std::string> hcq_dict = merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"HC_PRE_FUSION", "1"}});
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_q8_1_f32", "mul_mat_vecq.comp", hcq_dict);
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_q8_1_f32_subgroup", "mul_mat_vecq.comp", merge_maps(hcq_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_hc_pre_" + tname + "_q8_1_f32_subgroup_no_shmem", "mul_mat_vecq.comp", merge_maps(hcq_dict, {{"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+#endif
+        }
+
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m" || tname == "iq4_xs") {
