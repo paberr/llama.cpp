@@ -7891,8 +7891,9 @@ struct test_hc_mix : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    // quantized mat-vecs (q8_1 activations on the GPU), same tolerance as test_mul_mat
-    double max_nmse_err() override { return 5e-4; }
+    // two chained quantized mat-vecs (q8_1 activations on the GPU) with silu in between: the unfused Vulkan path
+    // exceeds 5e-4 in ~10 % of runs (2/20 for n_embd=2560, n_tokens=1), so 1e-3
+    double max_nmse_err() override { return 1e-3; }
 
     std::string vars() override {
         return VARS_TO_STR4(type, n_embd, n_lo, n_tokens);
