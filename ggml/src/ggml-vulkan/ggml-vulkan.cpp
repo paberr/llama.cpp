@@ -2964,6 +2964,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_f32_f32", arr_dmmv_q5_0_f32_f32_len[reduc], arr_dmmv_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_f32_f32", arr_dmmv_q5_1_f32_f32_len[reduc], arr_dmmv_q5_1_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            if (w == DMMV_WG_SIZE_SUBGROUP) {
+                const void *   hc_data[3] = { mul_mat_vec_hc_pre_q8_0_f32_f32_data, mul_mat_vec_hc_pre_q8_0_f32_f32_subgroup_data, mul_mat_vec_hc_pre_q8_0_f32_f32_subgroup_no_shmem_data };
+                const uint64_t hc_len[3]  = { mul_mat_vec_hc_pre_q8_0_f32_f32_len,  mul_mat_vec_hc_pre_q8_0_f32_f32_subgroup_len,  mul_mat_vec_hc_pre_q8_0_f32_f32_subgroup_no_shmem_len };
+                ggml_vk_create_pipeline(device, device->pipeline_mmv_hc_pre_q8_0_f32[i], "mul_mat_vec_hc_pre_q8_0_f32_f32", hc_len[reduc], hc_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 4, i+1}, 1, true, use_subgroups, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -3023,6 +3028,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_q8_1_f32", arr_dmmv_q8_0_q8_1_f32_len[reduc], arr_dmmv_q8_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(1*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(1*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
+                if (w == DMMV_WG_SIZE_SUBGROUP) {
+                    const void *   hcq_data[3] = { mul_mat_vec_hc_pre_q8_0_q8_1_f32_data, mul_mat_vec_hc_pre_q8_0_q8_1_f32_subgroup_data, mul_mat_vec_hc_pre_q8_0_q8_1_f32_subgroup_no_shmem_data };
+                    const uint64_t hcq_len[3]  = { mul_mat_vec_hc_pre_q8_0_q8_1_f32_len,  mul_mat_vec_hc_pre_q8_0_q8_1_f32_subgroup_len,  mul_mat_vec_hc_pre_q8_0_q8_1_f32_subgroup_no_shmem_len };
+                    ggml_vk_create_pipeline(device, device->pipeline_mmv_hc_pre_q8_0_q8_1[i], "mul_mat_vec_hc_pre_q8_0_q8_1_f32", hcq_len[reduc], hcq_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup_int, 4, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                }
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_int_n(2*rm_stdq_int, i), 1, 1}, {wg_size_subgroup_int, rm_int_n(2*rm_stdq_int, i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
@@ -6857,7 +6867,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
 
-    if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+    if (ctx->fused_mmv_hc_pre) {
+        // the hc gate mat-vec with the gated DSV4_HC_PRE fused (ggml_vk_can_fuse_mmv_hc_pre)
+        GGML_ASSERT(!swap_inputs && src0->type == GGML_TYPE_Q8_0 && (quantize_y || y_kernel_type == GGML_TYPE_F32));
+        dmmv = quantize_y ? ctx->device->pipeline_mmv_hc_pre_q8_0_q8_1[ne11 - 1] : ctx->device->pipeline_mmv_hc_pre_q8_0_f32[ne11 - 1];
+        GGML_ASSERT(dmmv != nullptr);
+    } else if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         dmmv = ggml_vk_get_64b_indexing_pipeline(ctx, dmmv);
     }
 
@@ -6991,9 +7006,21 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
     float    fuse_scale   = 0.0f;
     float    fuse_bias    = 0.0f;
+    uint32_t hc_row_stride = 0, hc_x_stride = 0, hc_d_stride = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->fused_mmv_scale_silu) {
+    if (ctx->fused_mmv_hc_pre) {
+        const ggml_tensor * pre = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * x   = pre->src[0];
+        fuse_scale    = ggml_get_op_params_f32(pre, 0);
+        hc_row_stride = (uint32_t) x->ne[0];
+        hc_x_stride   = (uint32_t) (x->nb[2] / sizeof(float));
+        hc_d_stride   = (uint32_t) (pre->nb[1] / sizeof(float));
+        d_F0          = ggml_vk_tensor_subbuffer(ctx, x);
+        // one workgroup per output element (wg denoms {1, 1, 1})
+        groups_x = hc_row_stride;
+        groups_z = 1;
+    } else if (ctx->fused_mmv_scale_silu) {
         const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
         memcpy(&fuse_scale, (const float *) scale->op_params + 0, sizeof(float));
         memcpy(&fuse_bias,  (const float *) scale->op_params + 1, sizeof(float));
@@ -7028,6 +7055,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
             d_row_stride,
             fuse_scale, fuse_bias,
+            hc_row_stride, hc_x_stride, hc_d_stride,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -13837,6 +13865,44 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// Q8_0 MUL_MAT (hyper-connection gate, [hc*n_embd] rows) -> RESHAPE -> DSV4_HC_PRE (gated): one dispatch where each
+// workgroup computes the hc gate rows of one output element and writes the gated mean (MUL_MAT_HC_PRE, bit-exact).
+// Returns the number of additional nodes (2) or 0.
+static int ggml_vk_can_fuse_mmv_hc_pre(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 2 >= cgraph->n_nodes || ctx->device->pipeline_mmv_hc_pre_q8_0_f32[0] == nullptr) {
+        return 0;
+    }
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * rs  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * pre = cgraph->nodes[node_idx + 2];
+    if (mm->op != GGML_OP_MUL_MAT || pre->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(pre, 1) == 0 ||
+        !ggml_vk_is_empty(const_cast<ggml_tensor *>(rs)) || rs->view_src != mm || rs->src[0] != mm || pre->src[1] != rs) {
+        return 0;
+    }
+    if ((mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (pre->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1) || ggml_node_get_use_count(cgraph, node_idx + 1) != 1 ||
+        (rs->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * x    = pre->src[0];
+    const int64_t n_embd = x->ne[0];
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || pre->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mm) ||
+        !ggml_is_contiguous(x) || !ggml_is_contiguous(pre) ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        mm->ne[1] < 1 || mm->ne[1] > mul_mat_vec_max_cols ||
+        x->ne[1] != 4 || mm->ne[0] != 4 * n_embd || x->ne[2] != mm->ne[1] || x->ne[3] != 1 ||
+        pre->ne[0] != n_embd || pre->ne[1] != mm->ne[1] ||
+        get_misalign_bytes(ctx, x) != 0 || get_misalign_bytes(ctx, pre) != 0 ||
+        ggml_vk_can_use_fwht(ctx, src1, mm)) {
+        return 0;
+    }
+    return 2;
+}
+
 // MUL_MAT (dense mat-vec path) -> SCALE -> UNARY(SILU): the mat-vec epilogue applies the scale and the silu
 // (MAT_VEC_FUSION_FLAGS_SCALE_SILU), computed the same way as scale.comp and op_silu on the f32 result
 static bool ggml_vk_can_fuse_mmv_scale_silu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -14941,6 +15007,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_mmv_scale_silu = false;
+        ctx->fused_mmv_hc_pre = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14949,6 +15016,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_mmv_hc_pre(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mmv_hc_pre = true;
+                fusion_string = "MUL_MAT_HC_PRE";
+                std::fill_n(op_srcs_fused_elementwise, 3, false);
             } else if (ggml_vk_can_fuse_mmv_scale_silu(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_mmv_scale_silu = true;
@@ -15190,6 +15262,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_mmv_scale_silu = false;
+                ctx->fused_mmv_hc_pre = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

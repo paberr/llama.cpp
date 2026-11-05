@@ -40,13 +40,39 @@ layout (push_constant) uniform parameter
     uint d_row_stride;
     float fuse_scale;
     float fuse_bias;
+    uint hc_row_stride; // HC_PRE_FUSION: distance between the hc gate rows of one output element (n_embd)
+    uint hc_x_stride;   // HC_PRE_FUSION: column (token) stride of the normed streams (fuse0)
+    uint hc_d_stride;   // HC_PRE_FUSION: column (token) stride of the mixed output
 #endif
 } p;
+
+#ifdef HC_PRE_FUSION
+// the rows of a workgroup are the hc gate rows of one output element, hc_row_stride apart
+#define MMV_ROW_STEP p.hc_row_stride
+#else
+#define MMV_ROW_STEP 1u
+#endif
 
 #ifndef MUL_MAT_ID
 uint mat_vec_d_idx(const uint j, const uint row) {
     return (p.fusion_flags & MAT_VEC_FLAGS_TRANSPOSE_D) != 0 ? row * p.d_row_stride + j : j * p.batch_stride_d + row;
 }
+
+#ifdef HC_PRE_FUSION
+// DSV4_HC_PRE (gated) fused after the hc gate mat-vec: rows n = 0..NUM_ROWS-1 of this workgroup are the gate of stream n
+// of output element first_row. Same arithmetic as dsv4_hc_pre.comp (GATED): fma chain over the streams in order, then scale.
+float hc_acc;
+void mat_vec_store(const uint j, const uint n, const uint first_row, const uint d_offset, const float g) {
+    if (n == 0) {
+        hc_acc = 0.0f;
+    }
+    const float wv = 1.0f / (1.0f + exp(-g));
+    hc_acc = fma(float(data_fuse0[j * p.hc_x_stride + first_row + n * p.hc_row_stride]), wv, hc_acc);
+    if (n == NUM_ROWS - 1) {
+        data_d[d_offset + j * p.hc_d_stride + first_row] = D_TYPE(p.fuse_scale * hc_acc);
+    }
+}
+#endif
 
 // the fused SCALE + UNARY(SILU) after a dense mat-vec, computed exactly like scale.comp and unary.comp (op_silu) on the f32 result
 float mat_vec_epilogue(const float r) {
@@ -56,6 +82,12 @@ float mat_vec_epilogue(const float r) {
     }
     return r;
 }
+
+#ifndef HC_PRE_FUSION
+void mat_vec_store(const uint j, const uint n, const uint first_row, const uint d_offset, const float r) {
+    data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(mat_vec_epilogue(r));
+}
+#endif
 #endif
 
 #ifdef MUL_MAT_ID
@@ -148,7 +180,7 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
 #else
-                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(mat_vec_epilogue(float(D_TYPE(temp[j][n]))));
+                mat_vec_store(j, n, first_row, d_offset, float(D_TYPE(temp[j][n])));
 #endif
             }
         }
@@ -210,7 +242,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
 #else
-                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(mat_vec_epilogue(float(D_TYPE(temp[j][n]))));
+                mat_vec_store(j, n, first_row, d_offset, float(D_TYPE(temp[j][n])));
 #endif
             }
         }
@@ -262,7 +294,7 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                 #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
 #else
-                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(mat_vec_epilogue(float(D_TYPE(tmpsh[j][n][0]))));
+                mat_vec_store(j, n, first_row, d_offset, float(D_TYPE(tmpsh[j][n][0])));
 #endif
             }
         }

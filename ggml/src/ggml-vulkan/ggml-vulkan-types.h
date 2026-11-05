@@ -799,6 +799,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    // Q8_0 hyper-connection gate mat-vec with the gated DSV4_HC_PRE fused (4 gate rows per workgroup), f32 / q8_1 activations
+    vk_pipeline pipeline_mmv_hc_pre_q8_0_f32[mul_mat_vec_max_cols];
+    vk_pipeline pipeline_mmv_hc_pre_q8_0_q8_1[mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
@@ -1259,6 +1262,8 @@ struct ggml_backend_vk_context {
 
     // the current MUL_MAT is fused with the SCALE + UNARY(SILU) after it (MAT_VEC_FUSION_FLAGS_SCALE_SILU)
     bool fused_mmv_scale_silu = false;
+    // the current MUL_MAT (hc gate) is fused with the gated DSV4_HC_PRE that consumes it (MUL_MAT_HC_PRE)
+    bool fused_mmv_hc_pre = false;
 
     // gated_delta_net fusions of the current graph (ggml_vk_find_gdn_fusions): the state GET_ROWS before it and the
     // snapshot CPY after it are skipped, the gdn shader reads s0 from and writes its snapshots to the cache itself
