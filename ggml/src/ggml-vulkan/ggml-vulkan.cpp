@@ -6972,6 +6972,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     uint32_t fusion_flags = 0;
+    uint32_t d_row_stride = 0;
+    if (swap_inputs && dst->ne[0] > 1) {
+        // swapped few-row matmul: write the result rows (src1 columns) straight into dst's row-major layout
+        fusion_flags |= MAT_VEC_FLAGS_TRANSPOSE_D;
+        d_row_stride  = (uint32_t) dst->ne[0];
+    }
 
     vk_subbuffer d_F0 = d_D;
     if (ctx->num_additional_fused_ops > 0) {
@@ -7002,6 +7008,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             stride_batch_x, stride_batch_y, stride_batch_d,
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            d_row_stride,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -7426,6 +7433,16 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
                src0->ne[1] <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                src1->ne[2] <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
+    // A few-row F32/F16 matrix times many columns (e.g. a 4 x 10240 F32 matrix at prompt processing) wastes nearly all of a
+    // matmul tile: swap the inputs (src1 as the matrix, the <= 8 rows of src0 as vectors) and write dst transposed back.
+    } else if (ctx->num_additional_fused_ops == 0 &&
+               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) && src1->type == GGML_TYPE_F32 &&
+               dst->ne[0] > 1 && dst->ne[0] <= mul_mat_vec_max_cols && dst->ne[1] > mul_mat_vec_max_cols &&
+               src0->ne[2] == 1 && src0->ne[3] == 1 &&
+               src1->ne[2] == 1 && src1->ne[3] == 1 &&
+               ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+               get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
+        ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
     // With one output row, B^T*A has the same flat output as A^T*B.
     } else if (ctx->num_additional_fused_ops == 0 &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
