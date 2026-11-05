@@ -1464,6 +1464,11 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // GET_ROWS nodes that gather a recurrent state for a GATED_DELTA_NET of the current graph and were skipped:
+    // the gdn kernel reads the state rows from the cache through the ids itself (see ggml_cuda_try_defer_gdn_state_gather)
+    struct gdn_state_gather { const ggml_tensor * rows; const float * src; const int32_t * ids; };
+    std::vector<gdn_state_gather> gdn_state_gathers;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
