@@ -6989,9 +6989,16 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FLAGS_TRANSPOSE_D;
         d_row_stride  = (uint32_t) dst->ne[0];
     }
+    float    fuse_scale   = 0.0f;
+    float    fuse_bias    = 0.0f;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->num_additional_fused_ops > 0) {
+    if (ctx->fused_mmv_scale_silu) {
+        const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+        memcpy(&fuse_scale, (const float *) scale->op_params + 0, sizeof(float));
+        memcpy(&fuse_bias,  (const float *) scale->op_params + 1, sizeof(float));
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE_SILU;
+    } else if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
@@ -7000,7 +7007,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     vk_subbuffer d_F1 = d_D;
-    if (ctx->num_additional_fused_ops == 2) {
+    if (!ctx->fused_mmv_scale_silu && ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -7020,6 +7027,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
             d_row_stride,
+            fuse_scale, fuse_bias,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -13829,6 +13837,36 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// MUL_MAT (dense mat-vec path) -> SCALE -> UNARY(SILU): the mat-vec epilogue applies the scale and the silu
+// (MAT_VEC_FUSION_FLAGS_SCALE_SILU), computed the same way as scale.comp and op_silu on the f32 result
+static bool ggml_vk_can_fuse_mmv_scale_silu(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY })) {
+        return false;
+    }
+    const ggml_tensor * mm    = cgraph->nodes[node_idx];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * unary = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * src0  = mm->src[0];
+    const ggml_tensor * src1  = mm->src[1];
+    if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU || scale->src[0] != mm || unary->src[0] != scale) {
+        return false;
+    }
+    if (mm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(mm) || !ggml_is_contiguous(scale) || !ggml_is_contiguous(unary) ||
+        get_misalign_bytes(ctx, unary) != 0) {
+        return false;
+    }
+    // only the plain dense mat-vec path of ggml_vk_mul_mat (not swapped, permuted, batched or fwht)
+    if (mm->ne[0] == 1 || mm->ne[1] > mul_mat_vec_max_cols || mm->ne[2] != 1 || mm->ne[3] != 1 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32 ||
+        !(ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) ||
+        ggml_vk_can_use_fwht(ctx, src1, mm)) {
+        return false;
+    }
+    return true;
+}
+
 bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
         return ggml_vk_can_fuse_unary_mul_pair(cgraph, node_idx);
@@ -14902,6 +14940,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_mmv_scale_silu = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14910,6 +14949,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_mmv_scale_silu(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mmv_scale_silu = true;
+                fusion_string = "MUL_MAT_SCALE_SILU";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";

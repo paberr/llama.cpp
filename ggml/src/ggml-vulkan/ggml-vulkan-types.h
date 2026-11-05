@@ -1105,6 +1105,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
 #define MAT_VEC_FLAGS_TRANSPOSE_D 0x20
 
 struct vk_staging_memcpy {
@@ -1255,6 +1256,9 @@ struct ggml_backend_vk_context {
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
+
+    // the current MUL_MAT is fused with the SCALE + UNARY(SILU) after it (MAT_VEC_FUSION_FLAGS_SCALE_SILU)
+    bool fused_mmv_scale_silu = false;
 
     // gated_delta_net fusions of the current graph (ggml_vk_find_gdn_fusions): the state GET_ROWS before it and the
     // snapshot CPY after it are skipped, the gdn shader reads s0 from and writes its snapshots to the cache itself

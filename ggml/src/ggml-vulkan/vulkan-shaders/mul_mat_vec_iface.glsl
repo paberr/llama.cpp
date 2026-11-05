@@ -6,6 +6,8 @@
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 // dense only: store result (row r, column j) at r * d_row_stride + j (swapped few-row matmul writing dst row-major)
 #define MAT_VEC_FLAGS_TRANSPOSE_D 0x20
+// dense only: dst = silu(dst * fuse_scale + fuse_bias), the fused SCALE + UNARY(SILU) that follows the mat-vec
+#define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

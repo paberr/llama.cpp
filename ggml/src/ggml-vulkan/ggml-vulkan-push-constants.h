@@ -30,6 +30,8 @@ struct vk_mat_vec_push_constants {
     uint32_t broadcast2;
     uint32_t broadcast3;
     uint32_t d_row_stride; // MAT_VEC_FLAGS_TRANSPOSE_D
+    float fuse_scale;   // MAT_VEC_FUSION_FLAGS_SCALE_SILU
+    float fuse_bias;
 };
 
 struct vk_mat_vec_p021_push_constants {
