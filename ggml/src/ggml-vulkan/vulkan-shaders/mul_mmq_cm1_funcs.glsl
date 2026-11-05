@@ -209,6 +209,45 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
     }
 }
 
+#elif defined(DATA_A_IQ3_S)
+
+// 8 values per loader: two 9-bit grid indices (4 values of 1..15 each) with 8 sign bits; scale d * (1 + 2 * sc) per 32 values.
+struct block_a_prefetch {
+    uint32_t qs;    // two 8-bit grid index low parts
+    uint32_t qh;    // their two high index bits (bits 0, 1)
+    uint32_t signs; // 8 sign bits
+    float d;
+};
+
+block_a_prefetch block_a_load(uint ib, uint loadr) {
+    block_a_prefetch blk;
+    const uint ib_k = ib / 8;
+    const uint ib32 = ib % 8;
+    blk.qs    = uint(data_a_packed16[ib_k].qs[ib32 * 4 + loadr]);
+    blk.qh    = uint(data_a_packed16[ib_k].qh[ib32 / 2]) >> ((ib32 & 1) * 8 + 2 * loadr);
+    blk.signs = uint(data_a_packed16[ib_k].signs[ib32 * 2 + loadr / 2]) >> ((loadr & 1) * 8);
+    blk.d = 0.0;
+    if (loadr == 0) {
+        const uint scale = (uint(data_a_packed16[ib_k].scales[ib32 / 4]) >> ((ib32 & 3) * 4)) & 0xF;
+        blk.d = float(data_a_packed16[ib_k].d) * float(1 + 2 * scale);
+    }
+    return blk;
+}
+
+void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bool in_bounds) {
+    const ivec4 vals0 = ivec4(unpack8(iq3s_grid[( blk.qs       & 0xFF) | ((blk.qh & 1) << 8)]));
+    const ivec4 vals1 = ivec4(unpack8(iq3s_grid[((blk.qs >> 8) & 0xFF) | ((blk.qh & 2) << 7)]));
+    // negate with (v ^ -s) - -s to avoid branches
+    const ivec4 m0 = -(ivec4(blk.signs,      blk.signs >> 1, blk.signs >> 2, blk.signs >> 3) & 1);
+    const ivec4 m1 = -(ivec4(blk.signs >> 4, blk.signs >> 5, blk.signs >> 6, blk.signs >> 7) & 1);
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+    buf_a_qs[buf_ib * QPITCH + ks * (BK / 4) + loadr * 2 + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+
+    if (loadr == 0) {
+        buf_a_d[ks * BM + buf_ib] = in_bounds ? blk.d : 0.0f;
+    }
+}
+
 #elif defined(DATA_A_MXFP4)
 
 struct block_a_prefetch {
