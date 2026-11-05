@@ -11304,6 +11304,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
 
+    // few-row F32 matrix times many columns (hyper-connection inject at prompt processing)
+    for (int64_t m : {2, 4, 8}) {
+        for (int64_t n : {9, 33, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, 1024, {1, 1}, {1, 1}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 4, 512, 10240, {1, 1}, {1, 1}));
+
 #if 0
     // > 2^31-element dst (8.9 GB), about 45 GB peak memory. Too large to be enabled by default.
     // kernel_mul_mm dst offset of the last batch is past INT32_MAX: rows 0-31 use full tiles, rows 32-39 use edge tiles.
