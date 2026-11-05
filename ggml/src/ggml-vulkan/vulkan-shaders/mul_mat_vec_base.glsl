@@ -42,7 +42,11 @@ layout (push_constant) uniform parameter
     float fuse_bias;
     uint hc_row_stride; // HC_PRE_FUSION: distance between the hc gate rows of one output element (n_embd)
     uint hc_x_stride;   // HC_PRE_FUSION: column (token) stride of the normed streams (fuse0)
-    uint hc_d_stride;   // HC_PRE_FUSION: column (token) stride of the mixed output
+    uint hc_d_stride;   // HC_PRE_FUSION: column (token) stride of the mixed output; HC_POST: token stride of dst
+    uint hc_r_stream;   // HC_POST: residual stream stride (token stride: hc_x_stride)
+    uint hc_d_stream;   // HC_POST: dst stream stride
+    uint hc_p_stream;   // HC_POST: gate input stream stride
+    uint hc_p_token;    // HC_POST: gate input token stride
 #endif
 } p;
 
@@ -86,6 +90,19 @@ float mat_vec_epilogue(const float r) {
 
 #ifndef HC_PRE_FUSION
 void mat_vec_store(const uint j, const uint n, const uint first_row, const uint d_offset, const float r) {
+    if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_HC_POST) != 0) {
+        // DSV4_HC_POST (gated, no comb) fused after the block output projection: each of the hc streams gets
+        // r * post[s] + residual[s], post[s] = gso * sigmoid(gsi * p[s]); same arithmetic as dsv4_hc_post.comp
+        const uint row = first_row + n;
+        [[unroll]] for (uint s = 0; s < 4; ++s) {
+            const float pv   = float(data_fuse1[j * p.hc_p_token + s * p.hc_p_stream]);
+            const float post = (1.0f / (1.0f + exp(-(pv * p.fuse_scale)))) * p.fuse_bias;
+            float result = r * post;
+            result += float(data_fuse0[j * p.hc_x_stride + s * p.hc_r_stream + row]);
+            data_d[d_offset + j * p.hc_d_stride + s * p.hc_d_stream + row] = D_TYPE(result);
+        }
+        return;
+    }
     data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(mat_vec_epilogue(r));
 }
 #endif

@@ -8,6 +8,8 @@
 #define MAT_VEC_FLAGS_TRANSPOSE_D 0x20
 // dense only: dst = silu(dst * fuse_scale + fuse_bias), the fused SCALE + UNARY(SILU) that follows the mat-vec
 #define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
+// dense only: the gated DSV4_HC_POST (no comb) that follows the block output projection, see mat_vec_store
+#define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
 #if defined(A_TYPEV4)

@@ -7918,6 +7918,49 @@ struct test_hc_mix : public test_case {
     }
 };
 
+// hyper-connection combine after a block output projection, as qwen4exp builds it:
+// out = hc_post(W_o @ h, residual, 2 * sigmoid(scale(inject, 1/hc)))  (backends may fuse it into the mat-vec epilogue)
+struct test_hc_combine : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t k;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_COMBINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, k, n_tokens);
+    }
+
+    test_hc_combine(ggml_type type = GGML_TYPE_Q8_0, int64_t n_embd = 256, int64_t k = 512, int64_t n_tokens = 1)
+        : type(type), n_embd(n_embd), k(k), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * w        = ggml_new_tensor_2d(ctx, type, k, n_embd);
+        ggml_tensor * h        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_tensor * inject   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(w, "w");
+        ggml_set_name(h, "h");
+        ggml_set_name(residual, "residual");
+        ggml_set_name(inject, "inject");
+
+        ggml_tensor * block_out = ggml_mul_mat(ctx, w, h);
+        ggml_tensor * g = ggml_scale(ctx, inject, 1.0f / (float) hc);
+        g = ggml_sigmoid(ctx, g);
+        g = ggml_scale(ctx, g, 2.0f);
+        ggml_tensor * out = ggml_dsv4_hc_post(ctx, block_out, residual, g, nullptr);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -11315,6 +11358,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_hc_mix(GGML_TYPE_Q8_0, 2560, 320, n_tokens));
     }
     test_cases.emplace_back(new test_hc_mix(GGML_TYPE_F32, 256, 64, 1));
+    for (int64_t n_tokens : {1, 2, 3, 8}) {
+        test_cases.emplace_back(new test_hc_combine(GGML_TYPE_Q8_0, 256, 512, n_tokens));
+        test_cases.emplace_back(new test_hc_combine(GGML_TYPE_Q8_0, 2560, 6144, n_tokens));
+    }
+    test_cases.emplace_back(new test_hc_combine(GGML_TYPE_F32, 256, 512, 3));
     test_cases.emplace_back(new test_hc_mix(GGML_TYPE_Q4_0, 256, 64, 3));
     for (int64_t d_conv : {3, 4, 7, 9}) {
         for (int64_t d_inner : {1024, 1536, 2048}) {

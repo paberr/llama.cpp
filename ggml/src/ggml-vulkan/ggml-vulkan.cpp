@@ -7007,9 +7007,29 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     float    fuse_scale   = 0.0f;
     float    fuse_bias    = 0.0f;
     uint32_t hc_row_stride = 0, hc_x_stride = 0, hc_d_stride = 0;
+    uint32_t hc_r_stream = 0, hc_d_stream = 0, hc_p_stream = 0, hc_p_token = 0;
 
     vk_subbuffer d_F0 = d_D;
-    if (ctx->fused_mmv_hc_pre) {
+    vk_subbuffer d_F1 = d_D;
+    if (ctx->fused_mmv_hc_post) {
+        // block output -> HC_POST_GATE (ggml_vk_can_fuse_mmv_hc_post)
+        GGML_ASSERT(!swap_inputs);
+        const ggml_tensor * sc_in = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * post  = cgraph->nodes[node_idx + 4];
+        const ggml_tensor * res   = post->src[1];
+        const ggml_tensor * pin   = sc_in->src[0];
+        fuse_scale  = ggml_get_op_params_f32(sc_in, 0);
+        fuse_bias   = ggml_get_op_params_f32(cgraph->nodes[node_idx + 3], 0);
+        hc_x_stride = (uint32_t) (res->nb[2]  / sizeof(float));
+        hc_r_stream = (uint32_t) (res->nb[1]  / sizeof(float));
+        hc_d_stride = (uint32_t) (post->nb[2] / sizeof(float));
+        hc_d_stream = (uint32_t) (post->nb[1] / sizeof(float));
+        hc_p_stream = (uint32_t) (pin->nb[0]  / sizeof(float));
+        hc_p_token  = (uint32_t) (pin->nb[1]  / sizeof(float));
+        d_F0 = ggml_vk_tensor_subbuffer(ctx, res);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx, pin);
+        fusion_flags |= MAT_VEC_FUSION_FLAGS_HC_POST;
+    } else if (ctx->fused_mmv_hc_pre) {
         const ggml_tensor * pre = cgraph->nodes[node_idx + 2];
         const ggml_tensor * x   = pre->src[0];
         fuse_scale    = ggml_get_op_params_f32(pre, 0);
@@ -7033,8 +7053,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
     }
 
-    vk_subbuffer d_F1 = d_D;
-    if (!ctx->fused_mmv_scale_silu && ctx->num_additional_fused_ops == 2) {
+    if (!ctx->fused_mmv_scale_silu && !ctx->fused_mmv_hc_pre && !ctx->fused_mmv_hc_post && ctx->num_additional_fused_ops == 2) {
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
@@ -7056,6 +7075,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             d_row_stride,
             fuse_scale, fuse_bias,
             hc_row_stride, hc_x_stride, hc_d_stride,
+            hc_r_stream, hc_d_stream, hc_p_stream, hc_p_token,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
@@ -13865,6 +13885,54 @@ static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int
            ggml_are_same_shape(scale_in->src[0], scale_out);
 }
 
+// MUL_MAT (block output projection, dense mat-vec path) -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST (no comb), the
+// HC_POST_GATE chain whose x is the mat-vec result: the mat-vec epilogue writes the hc streams (MAT_VEC_FUSION_FLAGS_HC_POST)
+static bool ggml_vk_can_fuse_mmv_hc_post(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 4 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm      = cgraph->nodes[node_idx];
+    const ggml_tensor * sc_in   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * sig     = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * sc_out  = cgraph->nodes[node_idx + 3];
+    const ggml_tensor * post    = cgraph->nodes[node_idx + 4];
+    if (mm->op != GGML_OP_MUL_MAT || sc_in->op != GGML_OP_SCALE || sig->op != GGML_OP_UNARY || sc_out->op != GGML_OP_SCALE ||
+        post->op != GGML_OP_DSV4_HC_POST || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        sig->src[0] != sc_in || sc_out->src[0] != sig || post->src[0] != mm || post->src[2] != sc_out || post->src[3] != nullptr ||
+        ggml_get_op_params_f32(sc_in, 1) != 0.0f || ggml_get_op_params_f32(sc_out, 1) != 0.0f) {
+        return false;
+    }
+    for (int k = 0; k <= 4; ++k) {
+        if ((cgraph->nodes[node_idx + k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+    // mm, sc_in, sig and sc_out are elided: only used inside the chain
+    if (!ggml_node_has_n_uses(cgraph, node_idx, 1) || !ggml_node_has_n_uses(cgraph, node_idx + 1, 1) ||
+        !ggml_node_has_n_uses(cgraph, node_idx + 2, 1) || !ggml_node_has_n_uses(cgraph, node_idx + 3, 1)) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * res  = post->src[1];
+    const ggml_tensor * pin  = sc_in->src[0];
+    const int64_t n_embd = mm->ne[0];
+    if (mm->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32 || res->type != GGML_TYPE_F32 || pin->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(mm) || mm->ne[1] < 1 || mm->ne[1] > mul_mat_vec_max_cols || mm->ne[2] != 1 || mm->ne[3] != 1 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || src1->type != GGML_TYPE_F32 ||
+        !(ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) ||
+        ggml_vk_can_use_fwht(ctx, src1, mm) ||
+        post->ne[0] != n_embd || post->ne[1] != 4 || post->ne[2] != mm->ne[1] || post->ne[3] != 1 ||
+        res->ne[0] != n_embd || res->ne[1] != 4 || res->ne[2] != mm->ne[1] ||
+        pin->ne[0] != 4 || pin->ne[1] != mm->ne[1] ||
+        post->nb[0] != sizeof(float) || res->nb[0] != sizeof(float) ||
+        get_misalign_bytes(ctx, post) != 0 || get_misalign_bytes(ctx, res) != 0 || get_misalign_bytes(ctx, pin) != 0) {
+        return false;
+    }
+    return true;
+}
+
 // Q8_0 MUL_MAT (hyper-connection gate, [hc*n_embd] rows) -> RESHAPE -> DSV4_HC_PRE (gated): one dispatch where each
 // workgroup computes the hc gate rows of one output element and writes the gated mean (MUL_MAT_HC_PRE, bit-exact).
 // Returns the number of additional nodes (2) or 0.
@@ -15008,6 +15076,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_mmv_scale_silu = false;
         ctx->fused_mmv_hc_pre = false;
+        ctx->fused_mmv_hc_post = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -15016,6 +15085,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_mmv_hc_post(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 4;
+                ctx->fused_mmv_hc_post = true;
+                fusion_string = "MUL_MAT_HC_POST";
+                std::fill_n(op_srcs_fused_elementwise, 5, false);
             } else if (ggml_vk_can_fuse_mmv_hc_pre(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 2;
                 ctx->fused_mmv_hc_pre = true;
@@ -15264,6 +15338,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_mmv_scale_silu = false;
                 ctx->fused_mmv_hc_pre = false;
+                ctx->fused_mmv_hc_post = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }

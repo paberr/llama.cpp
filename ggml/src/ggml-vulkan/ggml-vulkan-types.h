@@ -1110,6 +1110,7 @@ typedef std::vector<vk_submission> vk_sequence;
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
 #define MAT_VEC_FUSION_FLAGS_SCALE_SILU 0x10
 #define MAT_VEC_FLAGS_TRANSPOSE_D 0x20
+#define MAT_VEC_FUSION_FLAGS_HC_POST 0x40
 
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -1264,6 +1265,8 @@ struct ggml_backend_vk_context {
     bool fused_mmv_scale_silu = false;
     // the current MUL_MAT (hc gate) is fused with the gated DSV4_HC_PRE that consumes it (MUL_MAT_HC_PRE)
     bool fused_mmv_hc_pre = false;
+    // the current MUL_MAT (block output) is fused with the HC_POST_GATE chain that consumes it (MUL_MAT_HC_POST)
+    bool fused_mmv_hc_post = false;
 
     // gated_delta_net fusions of the current graph (ggml_vk_find_gdn_fusions): the state GET_ROWS before it and the
     // snapshot CPY after it are skipped, the gdn shader reads s0 from and writes its snapshots to the cache itself
