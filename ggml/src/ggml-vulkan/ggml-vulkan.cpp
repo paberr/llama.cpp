@@ -3786,6 +3786,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_cat_f32[0], "ssm_conv_cat_f32",           ssm_conv_cat_f32_len, ssm_conv_cat_f32_data, "main", 5, sizeof(vk_op_ssm_conv_cat_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_cat_f32[1], "ssm_conv_cat_silu_f32",      ssm_conv_cat_f32_len, ssm_conv_cat_f32_data, "main", 5, sizeof(vk_op_ssm_conv_cat_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_cat_f32[2], "ssm_conv_cat_bias_silu_f32", ssm_conv_cat_f32_len, ssm_conv_cat_f32_data, "main", 5, sizeof(vk_op_ssm_conv_cat_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9868,8 +9871,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
                 ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
             }
             if (op == GGML_OP_CONCAT && ggml_vk_concat_use_tiled(src0, src1, dst)) {
-                // one workgroup per 32x32 tile of dims 0/1 (wg denoms {32, 32, 1}), one z per dim 2
-                elements = { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] };
+                // one workgroup per 32x32 tile of dims 0/1 (wg denoms {32, 32, 1}), one z per dim 2;
+                // a conv input whose SSM_CONV reads the sources directly only needs its tail tiles
+                const auto tit = ctx->conv_cat_tail_tile.find(dst);
+                const uint32_t skip = tit != ctx->conv_cat_tail_tile.end() ? tit->second * 32 : 0;
+                elements = { (uint32_t) dst->ne[0] - skip, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] };
                 break;
             }
             // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
@@ -10601,6 +10607,33 @@ void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.
     const ggml_tensor * src2 = bias ? bias : src0;
 
+    const auto cit = ctx->conv_cat_direct.find(conv);
+    if (cit != ctx->conv_cat_direct.end()) {
+        // src0 is concat(state, transpose(x)); read state and x directly (ssm_conv_cat.comp)
+        const ggml_tensor * cat = cit->second;
+        const ggml_tensor * st  = cat->src[0];
+        const ggml_tensor * x   = cat->src[1];
+        vk_pipeline pipeline = ctx->device->pipeline_ssm_conv_cat_f32[ctx->num_additional_fused_ops];
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        const vk_subbuffer st_buf = ggml_vk_tensor_subbuffer(ctx, st,  true);
+        const vk_subbuffer x_buf  = ggml_vk_tensor_subbuffer(ctx, x,   true);
+        const vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+        const vk_subbuffer k_buf  = ggml_vk_tensor_subbuffer(ctx, src1);
+        const vk_subbuffer b_buf  = ggml_vk_tensor_subbuffer(ctx, src2);
+        const vk_op_ssm_conv_cat_push_constants pc = {
+            (uint32_t) st->ne[0],
+            (uint32_t) (st->nb[1] / 4), (uint32_t) (st->nb[2] / 4),
+            (uint32_t) (x->nb[0] / 4), (uint32_t) (x->nb[1] / 4), (uint32_t) (x->nb[2] / 4),
+            (uint32_t) src1->nb[1],
+            (uint32_t) dst->nb[1], (uint32_t) dst->nb[2],
+            (uint32_t) src1->ne[0], (uint32_t) src0->ne[1], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+            get_misalign_bytes(ctx, st) / 4, get_misalign_bytes(ctx, x) / 4, get_misalign_bytes(ctx, dst) / 4,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { st_buf, k_buf, b_buf, d_buf, x_buf }, pc,
+                                  { (uint32_t) src0->ne[1], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] });
+        return;
+    }
+
     ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
@@ -10693,6 +10726,11 @@ void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
         0,
         0.0f, 0.0f, op_params[0],
     }};
+    // concat_t: first 32-column tile to write (param1), see ggml_vk_find_conv_cat_fusions
+    const auto tit = ctx->conv_cat_tail_tile.find(dst);
+    if (tit != ctx->conv_cat_tail_tile.end()) {
+        pc.param1 = (float) tit->second;
+    }
     ggml_vk_op_f32<vk_op_concat_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONCAT, std::move(pc));
 }
 
@@ -14473,6 +14511,80 @@ static int32_t find_first_set(uint32_t x) {
 // Finds gated_delta_net nodes whose state gather (GET_ROWS from the cache) and snapshot copy (CPY into the cache) the
 // gdn shader can do itself (gated_delta_net.comp): one sequence, short batches (decode, MTP verify). The cache row may
 // then be read and written in place: each invocation reads its part of s0 before it writes the same elements.
+// Recurrent conv inputs: CONCAT(state, transpose(x)) along dim 0 (tiled concat) whose only users are one SSM_CONV (as src0)
+// and column windows of it (the tails copied back into the conv-state cache). The SSM_CONV then reads state and x directly
+// (ssm_conv_cat.comp, same arithmetic) and the concat only writes the tiles that contain the tail columns. At large ubatches
+// the materialised input (channels x (state + tokens) floats) no longer fits the last-level cache, and both the transposing
+// write and the strided conv read go to DRAM.
+static void ggml_vk_find_conv_cat_fusions(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->conv_cat_tail_tile.clear();
+    ctx->conv_cat_direct.clear();
+    if (ctx->device->disable_fusion || getenv("GGML_VK_DISABLE_CONV_CAT")) {
+        return;
+    }
+    // concat -> first column read through a view (ne0 if none yet, -1 if it has another kind of user)
+    std::unordered_map<const ggml_tensor *, int64_t> first_col;
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> conv_of;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_CONCAT && n->type == GGML_TYPE_F32 && n->src[0]->type == GGML_TYPE_F32 &&
+            n->src[0]->nb[0] == 4 && n->ne[2] == n->src[0]->ne[2] && ggml_is_contiguous(n) &&
+            ggml_vk_concat_use_tiled(n->src[0], n->src[1], n)) {
+            first_col[n] = n->ne[0];
+        }
+    }
+    if (first_col.empty()) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (src == nullptr) {
+                continue;
+            }
+            const ggml_tensor * root = src->view_src ? src->view_src : src;
+            auto it = first_col.find(root);
+            if (it == first_col.end() || it->second < 0) {
+                continue;
+            }
+            // views of the concat do not read it themselves
+            if (ggml_vk_is_empty(const_cast<ggml_tensor *>(n)) && n->view_src == root) {
+                continue;
+            }
+            if (src == root) {
+                if (n->op == GGML_OP_SSM_CONV && s == 0 && conv_of.find(root) == conv_of.end()) {
+                    conv_of[root] = n;
+                } else {
+                    it->second = -1;
+                }
+                continue;
+            }
+            // a window of columns over whole rows
+            if (src->type != root->type || src->nb[0] != root->nb[0] || src->nb[1] != root->nb[1] || src->nb[2] != root->nb[2] ||
+                src->ne[1] != root->ne[1] || src->ne[2] != root->ne[2] || src->ne[3] != 1 ||
+                src->view_offs >= root->nb[1] || src->view_offs % root->nb[0] != 0) {
+                it->second = -1;
+                continue;
+            }
+            const int64_t col = (int64_t) (src->view_offs / root->nb[0]);
+            if (col + src->ne[0] > root->ne[0]) {
+                it->second = -1;
+                continue;
+            }
+            it->second = std::min(it->second, col);
+        }
+    }
+    for (const auto & [cat, col] : first_col) {
+        const auto cit = conv_of.find(cat);
+        if (col < 0 || cit == conv_of.end()) {
+            continue;
+        }
+        ctx->conv_cat_tail_tile[cat] = (uint32_t) (col / 32);
+        ctx->conv_cat_direct[cit->second] = cat;
+    }
+}
+
 static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->gdn_fusions.clear();
     ctx->gdn_fused_skip.clear();
@@ -14607,6 +14719,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials_offset_calculation = false;
 
     ggml_vk_find_gdn_fusions(ctx, cgraph);
+    ggml_vk_find_conv_cat_fusions(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 
