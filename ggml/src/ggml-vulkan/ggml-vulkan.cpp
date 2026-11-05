@@ -12615,6 +12615,14 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
                 ctx->unsynced_nodes_written.push_back(gdn_fit->second.cache);
             }
         }
+        // an SSM_CONV reading concat(state, transpose(x)) directly reads state and x (not only its concat src)
+        if (cgraph->nodes[node_idx]->op == GGML_OP_SSM_CONV) {
+            const auto cit = ctx->conv_cat_direct.find(cgraph->nodes[node_idx]);
+            if (cit != ctx->conv_cat_direct.end()) {
+                ctx->unsynced_nodes_read.push_back(cit->second->src[0]);
+                ctx->unsynced_nodes_read.push_back(cit->second->src[1]);
+            }
+        }
         // Add all fused nodes to the unsynchronized lists.
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
@@ -14575,9 +14583,39 @@ static void ggml_vk_find_conv_cat_fusions(ggml_backend_vk_context * ctx, const g
             it->second = std::min(it->second, col);
         }
     }
+    // [data, data + nbytes) of the same backend buffer
+    auto const overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a->buffer != b->buffer || a->data == nullptr || b->data == nullptr) {
+            return false;
+        }
+        const uint8_t * a0 = (const uint8_t *) a->data; const uint8_t * a1 = a0 + ggml_nbytes(a);
+        const uint8_t * b0 = (const uint8_t *) b->data; const uint8_t * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
     for (const auto & [cat, col] : first_col) {
         const auto cit = conv_of.find(cat);
         if (col < 0 || cit == conv_of.end()) {
+            continue;
+        }
+        // the conv and its fused SILU / ADD+SILU outputs must not alias state or x, which it now reads directly
+        // (graph_optimize keeps both alive through that chain, this only guards against other allocators)
+        bool alias = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i] != cit->second) {
+                continue;
+            }
+            int last = i;
+            while (last + 1 < cgraph->n_nodes && last < i + 2 &&
+                   (cgraph->nodes[last + 1]->op == GGML_OP_ADD || cgraph->nodes[last + 1]->op == GGML_OP_UNARY) &&
+                   (cgraph->nodes[last + 1]->src[0] == cgraph->nodes[last] || cgraph->nodes[last + 1]->src[1] == cgraph->nodes[last])) {
+                last++;
+            }
+            for (int j = i; j <= last; ++j) {
+                alias |= overlaps(cgraph->nodes[j], cat->src[0]) || overlaps(cgraph->nodes[j], cat->src[1]);
+            }
+            break;
+        }
+        if (alias) {
             continue;
         }
         ctx->conv_cat_tail_tile[cat] = (uint32_t) (col / 32);
@@ -15211,6 +15249,27 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    // An SSM_CONV that reads concat(state, transpose(x)) may read state and x directly (ggml_vk_find_conv_cat_fusions):
+    // keep both alive through the conv and its fused SILU / ADD+SILU, so the allocator cannot reuse their memory for
+    // the outputs (x's last reader would otherwise be the concat).
+    if (params && params->add_alloc_dep && !ctx->device->disable_fusion) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * conv = graph->nodes[i];
+            ggml_tensor * cat  = conv->op == GGML_OP_SSM_CONV ? conv->src[0] : nullptr;
+            if (cat == nullptr || cat->op != GGML_OP_CONCAT || !ggml_vk_concat_use_tiled(cat->src[0], cat->src[1], cat)) {
+                continue;
+            }
+            int last = i;
+            while (last + 1 < graph->n_nodes && last < i + 2 &&
+                   (graph->nodes[last + 1]->op == GGML_OP_ADD || graph->nodes[last + 1]->op == GGML_OP_UNARY) &&
+                   (graph->nodes[last + 1]->src[0] == graph->nodes[last] || graph->nodes[last + 1]->src[1] == graph->nodes[last])) {
+                last++;
+            }
+            params->add_alloc_dep(params->user_data, cat->src[0], graph->nodes[last]);
+            params->add_alloc_dep(params->user_data, cat->src[1], graph->nodes[last]);
+        }
+    }
 
     if (ctx->device->disable_graph_optimize) {
         return;
