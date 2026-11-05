@@ -37,8 +37,15 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint d_row_stride;
 #endif
 } p;
+
+#ifndef MUL_MAT_ID
+uint mat_vec_d_idx(const uint j, const uint row) {
+    return (p.fusion_flags & MAT_VEC_FLAGS_TRANSPOSE_D) != 0 ? row * p.d_row_stride + j : j * p.batch_stride_d + row;
+}
+#endif
 
 #ifdef MUL_MAT_ID
 uint expert_id;
@@ -127,7 +134,11 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+#else
+                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(temp[j][n]);
+#endif
             }
         }
     }
@@ -185,7 +196,11 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(temp[j][n]);
+#else
+                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(temp[j][n]);
+#endif
             }
         }
     }
@@ -233,7 +248,11 @@ void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offs
                     tmpsh[j][n][0] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
 #endif
+                #ifdef MUL_MAT_ID
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+#else
+                data_d[d_offset + mat_vec_d_idx(j, first_row + n)] = D_TYPE(tmpsh[j][n][0]);
+#endif
             }
         }
     }
