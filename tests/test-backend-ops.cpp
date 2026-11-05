@@ -12033,6 +12033,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // dim 0 concat with a transposed second operand and no dim 3 (recurrent conv input [state ; x^T]), incl. ragged tile edges
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {3, 64, 1, 1}, {3, 1000, 1, 1}, {4, 77, 2, 1} }) {
+        for (int64_t nb : {32, 61, 517}) {
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, ne, nb, 0, 16));
+        }
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
             for (int dim : { 0, 1, 2, 3, }) {

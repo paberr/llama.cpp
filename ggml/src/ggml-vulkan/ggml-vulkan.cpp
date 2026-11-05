@@ -294,6 +294,17 @@ uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tens
     return tensor_offset - descriptor_offset;
 }
 
+// concat along dim 0 whose src1 is a transposed view (contiguous along dim 1): the generic shader reads it with a large
+// stride, concat_t moves 32x32 tiles through shared memory instead (same values, same positions)
+static bool ggml_vk_concat_use_tiled(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    const int dim = ((const int32_t *) dst->op_params)[0];
+    return dim == 0 && !ggml_is_quantized(dst->type) && ggml_type_size(dst->type) == 4 &&
+           src0->type == dst->type && src1->type == dst->type &&
+           dst->ne[3] == 1 && src0->ne[3] == 1 && src1->ne[3] == 1 &&
+           dst->nb[0] == 4 && src1->nb[1] == 4 && src1->nb[0] > src1->nb[1] &&
+           dst->ne[0] >= 32 && dst->ne[1] >= 32;
+}
+
 uint32_t ggml_vk_concat_unit_size(ggml_type type) {
     const uint32_t type_size = ggml_type_size(type);
 
@@ -3399,6 +3410,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_t_i32, "concat_t_i32", concat_t_i32_len, concat_t_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
@@ -8882,6 +8894,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
+        if (ggml_vk_concat_use_tiled(src0, src1, dst)) {
+            return ctx->device->pipeline_concat_t_i32;
+        }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
             return ctx->device->pipeline_concat_i8;
@@ -9826,6 +9841,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
             if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
                 ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
+            }
+            if (op == GGML_OP_CONCAT && ggml_vk_concat_use_tiled(src0, src1, dst)) {
+                // one workgroup per 32x32 tile of dims 0/1 (wg denoms {32, 32, 1}), one z per dim 2
+                elements = { (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] };
+                break;
             }
             // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
             // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.

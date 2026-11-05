@@ -1,0 +1,43 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+// concat along dim 0 where src1 is a transposed view (contiguous along dim 1), e.g. the conv input
+// [state ; x^T] of recurrent layers. The generic shader reads src1 with a large stride; this one moves a
+// 32x32 tile through shared memory, so both the src1 reads and the dst writes are contiguous.
+// Workgroup (x, y, z) covers dst[t0 .. t0+31, c0 .. c0+31, z], ne3 == 1.
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+shared D_TYPE tile[32][33];
+
+void main() {
+    const uint t0 = gl_WorkGroupID.x * 32;
+    const uint c0 = gl_WorkGroupID.y * 32;
+    const uint i2 = gl_WorkGroupID.z;
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+
+    // load: consecutive invocations walk dim 1, contiguous in src1
+    [[unroll]] for (uint k = 0; k < 32; k += 8) {
+        const uint i0 = t0 + ty + k;
+        const uint i1 = c0 + tx;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            tile[ty + k][tx] = i0 < p.ne00
+                ? D_TYPE(data_a[get_aoffset() + i2*p.nb02 + i1*p.nb01 + i0*p.nb00])
+                : D_TYPE(data_b[get_boffset() + i2*p.nb12 + i1*p.nb11 + (i0 - p.ne00)*p.nb10]);
+        }
+    }
+
+    barrier();
+
+    // store: consecutive invocations walk dim 0, contiguous in dst
+    [[unroll]] for (uint k = 0; k < 32; k += 8) {
+        const uint i0 = t0 + tx;
+        const uint i1 = c0 + ty + k;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            data_d[get_doffset() + i2*p.nb22 + i1*p.nb21 + i0*p.nb20] = tile[tx][ty + k];
+        }
+    }
+}
