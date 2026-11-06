@@ -4326,7 +4326,10 @@ vk_device ggml_vk_get_device(size_t idx) {
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
         // Submit at least every 100 nodes, in case there are workloads without as much matmul.
-        device->max_nodes_per_submit = 100;
+        // AMD integrated GPUs (Strix Halo, RADV): every 40 nodes. Decode/MTP graphs are mostly small dispatches; with 100-node
+        // submits the host finishes recording far ahead and sleeps, and the GPU runs the graph slower (MTP step 55.2 -> 51.3 ms,
+        // tg +2.4 %, pp3 +2.6 %; spinning instead of sleeping recovers only half of it). 25..50 nodes measure the same.
+        device->max_nodes_per_submit = (device->vendor_id == VK_VENDOR_ID_AMD && device->uma) ? 40 : 100;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
