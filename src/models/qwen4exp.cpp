@@ -668,7 +668,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (model.output_dv) {
+    if (model.output_dv && cparams.draft_vocab) {
         // draft vocabulary: score the subset, the other logits are -inf (see load_tensors_draft_vocab)
         const int64_t n_vocab = model.output->ne[1];
         const int64_t n_out   = cur->ne[1];

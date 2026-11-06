@@ -2190,6 +2190,7 @@ void llama_model_base::load_tensors_draft_vocab() {
     if (ids.empty() || (int64_t) ids.size() >= n_vocab) {
         return;
     }
+    output_dv_keep.assign(keep.begin(), keep.end());
 
     const size_t row_size = ggml_row_size(output->type, output->ne[0]);
     GGML_ASSERT(output->nb[1] == row_size && ggml_is_contiguous(output));
@@ -3629,6 +3630,17 @@ int32_t llama_model_n_embd_out(const llama_model * model) {
 
 int32_t llama_model_n_layer(const llama_model * model) {
     return model->hparams.n_layer();
+}
+
+int32_t llama_model_draft_vocab_n(const llama_model * model) {
+    return model->output_dv ? (int32_t) model->output_dv->ne[1] : 0;
+}
+
+bool llama_model_draft_vocab_has(const llama_model * model, llama_token token) {
+    if (model->output_dv == nullptr) {
+        return true;
+    }
+    return token >= 0 && (size_t) token < model->output_dv_keep.size() && model->output_dv_keep[token];
 }
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {

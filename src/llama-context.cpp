@@ -217,6 +217,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.draft_vocab             = true;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1418,6 +1419,14 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+}
+
+void llama_context::set_draft_vocab(bool enable) {
+    if (cparams.draft_vocab != enable) {
+        // the head changes the graph
+        sched_need_reserve = true;
+    }
+    cparams.draft_vocab = enable;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -4523,6 +4532,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_draft_vocab(llama_context * ctx, bool enable) {
+    ctx->set_draft_vocab(enable);
 }
 
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {

@@ -128,6 +128,12 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
 
+// draft vocabulary (LLAMA_DRAFT_VOCAB, draft models only): number of tokens in the subset (0 = none), membership,
+// and a per-context switch between the subset head and the full head (default: subset)
+LLAMA_API int32_t llama_model_draft_vocab_n(const struct llama_model * model);
+LLAMA_API bool    llama_model_draft_vocab_has(const struct llama_model * model, llama_token token);
+LLAMA_API void    llama_set_draft_vocab(struct llama_context * ctx, bool enable);
+
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
 // chain multiple trained NextN heads. Default 0 (first head).

@@ -1563,6 +1563,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // draft vocabulary (LLAMA_DRAFT_VOCAB): the subset head is used while the recent target tokens stay inside the
+    // subset; text in other languages or domains switches the context back to the full head
+    static constexpr int dv_window = 128; // last target tokens (prompt and accepted)
+    static constexpr int dv_off    = 6;   // >= this many outside the subset: full head
+    static constexpr int dv_on     = 2;   // <= this many outside the subset: subset head
+    bool             dv_avail = false;
+    bool             dv_on_   = true;
+    std::vector<uint8_t> dv_ring;
+    int              dv_pos   = 0;
+    int              dv_out   = 0;
+
+    void dv_observe(llama_token id) {
+        const uint8_t out = llama_model_draft_vocab_has(llama_get_model(params.ctx_dft), id) ? 0 : 1;
+        dv_out += out - dv_ring[dv_pos];
+        dv_ring[dv_pos] = out;
+        dv_pos = (dv_pos + 1) % dv_window;
+        const bool want = dv_on_ ? dv_out < dv_off : dv_out <= dv_on;
+        if (want != dv_on_) {
+            dv_on_ = want;
+            llama_set_draft_vocab(params.ctx_dft, dv_on_);
+            LOG_INF("spec draft-mtp: draft vocabulary %s (%d of the last %d tokens outside)\n", dv_on_ ? "on" : "off", dv_out, dv_window);
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1630,6 +1654,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+
+        dv_avail = llama_model_draft_vocab_n(llama_get_model(ctx_dft)) > 0;
+        dv_ring.assign(dv_window, 0);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1702,6 +1729,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+
+        if (dv_avail) {
+            for (int k = 0; k < n_tokens; ++k) {
+                if (batch_in.tokens[k].id != LLAMA_TOKEN_NULL) {
+                    dv_observe(batch_in.tokens[k].id);
+                }
+            }
+        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 

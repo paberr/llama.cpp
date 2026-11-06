@@ -788,6 +788,7 @@ struct llama_model {
     // draft heads only (LLAMA_DRAFT_VOCAB): the output rows of a token subset and their token ids
     struct ggml_tensor * output_dv     = nullptr;
     struct ggml_tensor * output_dv_ids = nullptr;
+    std::vector<uint8_t> output_dv_keep; // [n_vocab] host-side membership of the subset
 
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
