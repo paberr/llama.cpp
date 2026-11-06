@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// MoE output: weight each expert's row and sum over the experts,
+//
+//   dst[i0, it] = sum_e x[i0, e, it]*w[e, it]
+//
+// in place of MUL(x, w) followed by an ADD chain over its expert views. Each product is rounded to f32 and the sums
+// run in expert order, exactly as the separate ops do (precise: no fma contraction).
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter
+{
+    uint ne0;
+    uint n_used;
+    uint n_tokens;
+
+    uint nbx1; uint nbx2;
+    uint nbw1; uint nbw2;
+    uint nbd1;
+
+    uint x_offset;
+    uint w_offset;
+    uint d_offset;
+};
+
+layout(binding = 0, std430) readonly buffer X { float data_x[]; };
+layout(binding = 1, std430) readonly buffer W { float data_w[]; };
+layout(binding = 2, std430) writeonly buffer D { float data_d[]; };
+
+void main() {
+    const uint i0 = gl_WorkGroupID.x * BLOCK_SIZE + gl_LocalInvocationID.x;
+    const uint it = gl_WorkGroupID.y;
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const uint xb = x_offset + it * nbx2 + i0;
+    const uint wb = w_offset + it * nbw2;
+
+    precise float sum = data_x[xb] * data_w[wb];
+    for (uint e = 1; e < n_used; ++e) {
+        precise float v = data_x[xb + e * nbx1] * data_w[wb + e * nbw1];
+        sum = sum + v;
+    }
+    data_d[d_offset + it * nbd1 + i0] = sum;
+}

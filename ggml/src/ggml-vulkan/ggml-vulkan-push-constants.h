@@ -185,6 +185,20 @@ struct vk_op_dsv4_hc_comb_push_constants {
     uint32_t n_iter;
 };
 
+struct vk_op_moe_wsum_push_constants {
+    uint32_t ne0;
+    uint32_t n_used;
+    uint32_t n_tokens;
+
+    uint32_t nbx1; uint32_t nbx2;
+    uint32_t nbw1; uint32_t nbw2;
+    uint32_t nbd1;
+
+    uint32_t x_offset;
+    uint32_t w_offset;
+    uint32_t d_offset;
+};
+
 struct vk_op_dsv4_hc_pre_push_constants {
     uint32_t n_embd;
     uint32_t n_tokens;
@@ -972,6 +986,15 @@ template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * 
     p.b_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 
+    GGML_UNUSED(src3);
+}
+
+template <> inline void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_moe_wsum_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.x_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.w_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    GGML_UNUSED(src2);
     GGML_UNUSED(src3);
 }
 
