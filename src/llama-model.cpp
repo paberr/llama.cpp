@@ -2138,7 +2138,105 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    if (ml.model_shared != nullptr) {
+        load_tensors_draft_vocab();
+    }
+
     return true;
+}
+
+// Speculative draft heads may score only a subset of the vocabulary (frequency-ranked token ids from a file).
+// The rows of that subset are gathered once into a separate tensor next to the output weight; the draft graph
+// scatters the subset logits into a full-size logits row whose other entries are -inf. Draft tokens are always
+// verified by the target, so this changes the acceptance rate, never the generated text.
+// LLAMA_DRAFT_VOCAB=<file of token ids, most frequent first>, LLAMA_DRAFT_VOCAB_N=<number of ids to use>
+void llama_model_base::load_tensors_draft_vocab() {
+    const char * path = getenv("LLAMA_DRAFT_VOCAB");
+    if (path == nullptr || output == nullptr || output->buffer == nullptr) {
+        return;
+    }
+    const char * n_env = getenv("LLAMA_DRAFT_VOCAB_N");
+    const int64_t n_max = n_env ? atoll(n_env) : INT64_MAX;
+    const int64_t n_vocab = output->ne[1];
+
+    std::vector<char> keep(n_vocab, 0);
+    {
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            throw std::runtime_error(format("LLAMA_DRAFT_VOCAB: cannot open %s", path));
+        }
+        long long id = 0;
+        int64_t n_read = 0;
+        while (n_read < n_max && fscanf(f, " %lld ,", &id) == 1) {
+            if (id >= 0 && id < n_vocab && !keep[id]) {
+                keep[id] = 1;
+                n_read++;
+            }
+        }
+        fclose(f);
+    }
+    // control and user-defined tokens (chat template, end of turn) are always kept
+    for (int64_t id = 0; id < n_vocab && id < (int64_t) vocab.n_tokens(); ++id) {
+        if (vocab.token_get_attr((llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+            keep[id] = 1;
+        }
+    }
+    std::vector<int32_t> ids;
+    for (int64_t id = 0; id < n_vocab; ++id) {
+        if (keep[id]) {
+            ids.push_back((int32_t) id);
+        }
+    }
+    if (ids.empty() || (int64_t) ids.size() >= n_vocab) {
+        return;
+    }
+
+    const size_t row_size = ggml_row_size(output->type, output->ne[0]);
+    GGML_ASSERT(output->nb[1] == row_size && ggml_is_contiguous(output));
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    output_dv     = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], (int64_t) ids.size());
+    output_dv_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t) ids.size());
+    ggml_set_name(output_dv,     "output_draft_vocab.weight");
+    ggml_set_name(output_dv_ids, "output_draft_vocab.ids");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buffer) {
+        throw std::runtime_error(format("unable to allocate %s draft vocabulary buffer", ggml_backend_buft_name(buft)));
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // gather in chunks of the output weight to bound host memory
+    std::vector<uint8_t> rows(ids.size() * row_size);
+    const int64_t chunk = 16384;
+    std::vector<uint8_t> src((size_t) chunk * row_size);
+    size_t j = 0;
+    for (int64_t r0 = 0; r0 < n_vocab && j < ids.size(); r0 += chunk) {
+        const int64_t nr = std::min(chunk, n_vocab - r0);
+        if (ids[j] >= r0 + nr) {
+            continue;
+        }
+        ggml_backend_tensor_get(output, src.data(), (size_t) r0 * row_size, (size_t) nr * row_size);
+        for (; j < ids.size() && ids[j] < r0 + nr; ++j) {
+            memcpy(rows.data() + j * row_size, src.data() + (size_t) (ids[j] - r0) * row_size, row_size);
+        }
+    }
+    GGML_ASSERT(j == ids.size());
+    ggml_backend_tensor_set(output_dv, rows.data(), 0, rows.size());
+    ggml_backend_tensor_set(output_dv_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+
+    LLAMA_LOG_INFO("%s: draft vocabulary: %zu of %lld tokens (%.1f MiB, %s)\n", __func__, ids.size(), (long long) n_vocab,
+            rows.size() / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

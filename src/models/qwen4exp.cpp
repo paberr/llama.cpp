@@ -668,7 +668,18 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.output_dv) {
+        // draft vocabulary: score the subset, the other logits are -inf (see load_tensors_draft_vocab)
+        const int64_t n_vocab = model.output->ne[1];
+        const int64_t n_out   = cur->ne[1];
+        ggml_tensor * sub = build_lora_mm(model.output_dv, cur, model.output_s);
+        cb(sub, "result_output_dv", -1);
+        ggml_tensor * full = ggml_fill_inplace(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_out), -INFINITY);
+        full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, sub, 1, sub->ne[0], n_out), model.output_dv_ids);
+        cur = ggml_reshape_2d(ctx0, full, n_vocab, n_out);
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
