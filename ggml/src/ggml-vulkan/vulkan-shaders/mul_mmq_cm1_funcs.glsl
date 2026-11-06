@@ -4,6 +4,25 @@
 //   block_a_load()           — load from global memory into a block_a_prefetch
 //   block_a_to_shmem()       — unpack and write to shared memory
 
+#if defined(MUL_MAT_ID) && defined(DATA_A_IQ3_S)
+// MUL_MAT_ID: few tokens per expert, so the A loads cannot hide behind the matmuls. Each row's 256-value chunk
+// is fetched whole with coalesced 32-bit loads (issued about 4 k steps ahead), staged raw in LDS and decoded
+// from there for each 64-value k step. Blocks are only 2-byte aligned, so a chunk may start 2 bytes into a word.
+layout (binding = 0) readonly buffer A_RAW32 {uint data_a_raw32[];};
+#define RAW_PITCH_MAX 29
+shared uint raw_a[BM * RAW_PITCH_MAX];
+
+uint raw_word(uint row, uint b) {
+    return raw_a[row * RAW_PITCH_MAX + (b >> 2)];
+}
+uint raw_byte(uint row, uint b) {
+    return (raw_word(row, b) >> ((b & 3u) * 8u)) & 0xFFu;
+}
+uint raw_u16(uint row, uint b) { // b even
+    return (raw_word(row, b) >> ((b & 2u) * 8u)) & 0xFFFFu;
+}
+#endif
+
 #if defined(DATA_A_Q4_0)
 
 struct block_a_prefetch {
@@ -247,6 +266,28 @@ void block_a_to_shmem(block_a_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
         buf_a_d[ks * BM + buf_ib] = in_bounds ? blk.d : 0.0f;
     }
 }
+
+
+#if defined(MUL_MAT_ID)
+#define RAW_A 1
+// 256-value chunk = one 110-byte superblock
+#define RAW_WORDS 28
+#define RAW_CHUNK_BYTE(u) (((u) / 8u) * 110u)
+
+// sh: byte offset of the chunk inside its first staged word; ib32: 32-value sub-block in the chunk (0..7)
+block_a_prefetch block_a_from_raw(uint row, uint sh, uint ib32, uint loadr) {
+    block_a_prefetch blk;
+    blk.qs    = raw_u16(row, sh + 2u + ib32 * 8u + loadr * 2u);
+    blk.qh    = raw_byte(row, sh + 66u + ib32) >> (2u * loadr);
+    blk.signs = raw_byte(row, sh + 74u + ib32 * 4u + loadr);
+    blk.d = 0.0;
+    if (loadr == 0) {
+        const uint scale = (raw_byte(row, sh + 106u + ib32 / 2u) >> ((ib32 & 1u) * 4u)) & 0xFu;
+        blk.d = unpackHalf2x16(raw_u16(row, sh)).x * float(1 + 2 * scale);
+    }
+    return blk;
+}
+#endif // MUL_MAT_ID
 
 #elif defined(DATA_A_MXFP4)
 
@@ -592,7 +633,11 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
 #endif
 
-#define PREFETCH_BLOCK(blk)                                                                     \
+
+#ifdef RAW_A
+#define PREFETCH_A(blk)
+#else
+#define PREFETCH_A(blk)                                                                         \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
@@ -603,7 +648,11 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
                 pre_a[li * BK_STEP + ks] = block_a_load(ib_k, loadr_a);                         \
             }                                                                                   \
         }                                                                                       \
-    }                                                                                           \
+    }
+#endif
+
+#define PREFETCH_BLOCK(blk)                                                                     \
+    PREFETCH_A(blk)                                                                             \
     [[unroll]] for (uint li = 0; li < B_LOADS; li++) {                                          \
         const uint buf_ib = loadc_b + li * loadstride_b;                                        \
         if (buf_ib < BN) {                                                                      \
@@ -615,13 +664,21 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
         }                                                                                       \
     }
 
+#ifdef RAW_A
+#define BLK_A_SRC(blk) block_a_from_raw(buf_ib,                                                  \
+            RAW_CHUNK_BYTE(raw_u0 + buf_ib * raw_ustride + ((blk) / 256u) * 8u) & 3u,           \
+            (((blk) % 256u) / BK) + ks, loadr_a)
+#else
+#define BLK_A_SRC(blk) pre_a[li * BK_STEP + ks]
+#endif
+
 #define STORE_BLOCK_TO_LDS(blk)                                                                 \
     [[unroll]] for (uint li = 0; li < A_LOADS; li++) {                                          \
         const uint buf_ib = loadc_a + li * loadstride_a;                                        \
         if (buf_ib < BM) {                                                                      \
             [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {                                  \
                 const bool in_bounds = (blk) + ks * BK < end_k;                                 \
-                block_a_to_shmem(pre_a[li * BK_STEP + ks], buf_ib, ks, loadr_a, in_bounds);     \
+                block_a_to_shmem(BLK_A_SRC(blk), buf_ib, ks, loadr_a, in_bounds);               \
             }                                                                                   \
         }                                                                                       \
     }                                                                                           \
@@ -634,3 +691,28 @@ void block_b_to_shmem(block_b_prefetch blk, uint buf_ib, uint ks, uint loadr, bo
             }                                                                                   \
         }                                                                                       \
     }
+
+#ifdef RAW_A
+#define RAW_LOADS ((BM * RAW_WORDS + BLOCK_SIZE - 1) / BLOCK_SIZE)
+
+// rows past M re-read the last valid row (never stored); words past the buffer read as 0
+#define RAW_PREFETCH(j)                                                                         \
+    [[unroll]] for (uint i = 0; i < RAW_LOADS; i++) {                                           \
+        const uint lin = gl_LocalInvocationIndex + i * BLOCK_SIZE;                              \
+        const uint row = lin / RAW_WORDS;                                                       \
+        if (row < BM) {                                                                         \
+            const uint rr = min(row, raw_rows - 1u);                                            \
+            const uint word = RAW_CHUNK_BYTE(raw_u0 + rr * raw_ustride + (j) * 8u) / 4u + lin % RAW_WORDS; \
+            raw_pre[i] = word < raw_len ? data_a_raw32[word] : 0u;                              \
+        }                                                                                       \
+    }
+
+#define RAW_STORE                                                                               \
+    [[unroll]] for (uint i = 0; i < RAW_LOADS; i++) {                                           \
+        const uint lin = gl_LocalInvocationIndex + i * BLOCK_SIZE;                              \
+        const uint row = lin / RAW_WORDS;                                                       \
+        if (row < BM) {                                                                         \
+            raw_a[row * RAW_PITCH_MAX + lin % RAW_WORDS] = raw_pre[i];                              \
+        }                                                                                       \
+    }
+#endif

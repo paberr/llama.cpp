@@ -145,6 +145,13 @@ ACC_TYPE cm1_accumulate(ACC_TYPE prev, int acc_e, float scale_a, float nbias_a, 
 #include "mul_mm_id_funcs.glsl"
 #endif
 
+// MUL_MAT_ID with symmetric single-scale types: an expert tile holds few tokens, so the 16x16 output blocks of
+// the columns that hold tokens are spread round-robin over all subgroups instead of each subgroup owning a
+// fixed WM x WN region (where most subgroups would have no columns).
+#if defined(MUL_MAT_ID) && KSCALES == 1 && !(defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1) || defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K))
+#define MMID_STRIPE 1
+#endif
+
 #include "mul_mmq_cm1_funcs.glsl"
 
 void main() {
@@ -273,13 +280,33 @@ void main() {
     block_a_prefetch pre_a[A_LOADS * BK_STEP];
     block_b_prefetch pre_b[B_LOADS * BK_STEP];
 
+#ifdef RAW_A
+    // 32-value unit index of row 0 at k = 0, units per row, valid rows, number of 256-value chunks
+    const uint raw_u0 = pos_a_ib;
+    const uint raw_ustride = p.stride_a / BK;
+    const uint raw_rows = min(BM, p.M - ir * BM);
+    const uint raw_nsb = (p.K + 255u) / 256u;
+    const uint raw_len = data_a_raw32.length();
+    uint raw_pre[RAW_LOADS];
+    RAW_PREFETCH(0u)
+    RAW_STORE
+    if (raw_nsb > 1u) {
+        RAW_PREFETCH(1u)
+    }
+#endif
+
     if (start_k < end_k) {
         PREFETCH_BLOCK(start_k)
     }
 
     const uint a_row0 = warp_r * WM;
     const uint b_col0 = warp_c * WN;
-#ifdef MUL_MAT_ID
+#if defined(MMID_STRIPE)
+    const bool active_col_tile = true;
+    const uint NW = BLOCK_SIZE / WARP;
+    const uint RB = BM / TM;
+    const uint NJ = cms_per_row * cms_per_col;
+#elif defined(MUL_MAT_ID)
     const bool active_col_tile = ic * BN + b_col0 < _ne1;
 #else
     const bool active_col_tile = ic * BN + b_col0 < p.N;
@@ -299,6 +326,15 @@ void main() {
         if (next_block < end_k) {
             PREFETCH_BLOCK(next_block)
         }
+#ifdef RAW_A
+        // last k step of a superblock: everyone has decoded it (barrier above), stage the next one
+        if (next_block % 256u == 0u && next_block < end_k) {
+            RAW_STORE
+            if (next_block / 256u + 1u < raw_nsb) {
+                RAW_PREFETCH(next_block / 256u + 1u)
+            }
+        }
+#endif
 
         if (active_col_tile) {
         [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {
@@ -392,6 +428,82 @@ void main() {
                     }
                 }
             }
+#elif defined(MMID_STRIPE)
+            // When the subgroup count is a multiple of the row blocks, a subgroup keeps one row block
+            // (r_blk = warp_i % RB) for all its j, so its A fragments are loaded once per k step.
+            const bool fixed_r = (NW % RB) == 0;
+            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[K_SUB];
+            float scale_a[CM_ELEMS];
+            if (fixed_r) {
+                const uint r_blk = warp_i % RB;
+                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                    coopMatLoad(cache_a[h], buf_a_qs, (r_blk * TM) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                    scale_a[e] = buf_a_d[ks * BM + r_blk * TM + cm_elem_row(e)];
+                }
+            }
+            // full tile: every block of this subgroup has tokens; preload all B fragments (ILP), no branches
+            const bool full_tile = fixed_r && (warp_i + NW * (NJ - 1)) / RB * TN < _ne1;
+            if (full_tile) {
+                coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_bf[NJ * K_SUB];
+                [[unroll]] for (uint j = 0; j < NJ; j++) {
+                    const uint c_blk = (warp_i + NW * j) / RB;
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        coopMatLoad(cache_bf[j * K_SUB + h], buf_b_qs, (c_blk * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
+                    }
+                }
+                [[unroll]] for (uint j = 0; j < NJ; j++) {
+                    const uint c_blk = (warp_i + NW * j) / RB;
+                    const float scale_b = buf_b_d[ks * BN + c_blk * TN + elem_col0];
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+                            USE_MAGIC_BIAS ? ACC_BIAS_BITS : 0);
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        acc = coopMatMulAdd(cache_a[h], cache_bf[j * K_SUB + h], acc);
+                    }
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                        const float nbias_a = USE_MAGIC_BIAS ? -ACC_BIAS_F * scale_a[e] : 0.0;
+                        sums[j * CM_ELEMS + e] = cm1_accumulate(
+                            sums[j * CM_ELEMS + e], int(acc[e]),
+                            scale_a[e], nbias_a, scale_b, 0.0);
+                    }
+                }
+            } else
+            [[unroll]] for (uint j = 0; j < NJ; j++) {
+                const uint blk_i = warp_i + NW * j;
+                const uint r_blk = blk_i % RB;
+                const uint c_blk = blk_i / RB;
+                if (c_blk * TN < _ne1) {
+                    if (!fixed_r) {
+                        [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                            coopMatLoad(cache_a[h], buf_a_qs, (r_blk * TM) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                        [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                            scale_a[e] = buf_a_d[ks * BM + r_blk * TM + cm_elem_row(e)];
+                        }
+                    }
+                    coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[K_SUB];
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        coopMatLoad(cache_b[h], buf_b_qs, (c_blk * TN) * QPITCH + ks * (BK / 4) + h * (TK / 4), QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
+                    }
+                    const float scale_b = buf_b_d[ks * BN + c_blk * TN + elem_col0];
+
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(
+                            USE_MAGIC_BIAS ? ACC_BIAS_BITS : 0);
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        acc = coopMatMulAdd(cache_a[h], cache_b[h], acc);
+                    }
+
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                        const float nbias_a = USE_MAGIC_BIAS ? -ACC_BIAS_F * scale_a[e] : 0.0;
+                        sums[j * CM_ELEMS + e] = cm1_accumulate(
+                            sums[j * CM_ELEMS + e], int(acc[e]),
+                            scale_a[e], nbias_a, scale_b, 0.0);
+                    }
+                }
+            }
 #else
             // Preload all A/B fragments up front (ILP).
             coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row * K_SUB];
@@ -454,7 +566,24 @@ void main() {
     const uint dr = ir * BM + a_row0;
     const uint dc = ic * BN + b_col0;
 
-#ifdef MUL_MAT_ID
+#if defined(MMID_STRIPE)
+    [[unroll]] for (uint j = 0; j < NJ; j++) {
+        const uint blk_i = warp_i + NW * j;
+        const uint r_blk = blk_i % RB;
+        const uint c_blk = blk_i / RB;
+        [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+            const uint col_i = c_blk * TN + elem_col0;
+            if (col_i >= _ne1) continue;
+
+            const uint row_g = ir * BM + r_blk * TM + cm_elem_row(e);
+            if (row_g >= p.M) continue;
+
+            const u16vec2 row_idx = row_ids[col_i];
+            const uint store_offset = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + row_g;
+            data_d[store_offset] = D_TYPE(sums[j * CM_ELEMS + e]);
+        }
+    }
+#elif defined(MUL_MAT_ID)
     [[unroll]] for (uint r = 0; r < cms_per_row; r++) {
         [[unroll]] for (uint c = 0; c < cms_per_col; c++) {
             const uint tile_idx = r * cms_per_col + c;
