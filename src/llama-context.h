@@ -121,6 +121,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_draft_vocab(bool enable);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
 

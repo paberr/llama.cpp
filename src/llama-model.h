@@ -785,6 +785,11 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // draft heads only (LLAMA_DRAFT_VOCAB): the output rows of a token subset and their token ids
+    struct ggml_tensor * output_dv     = nullptr;
+    struct ggml_tensor * output_dv_ids = nullptr;
+    std::vector<uint8_t> output_dv_keep; // [n_vocab] host-side membership of the subset
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
@@ -1042,6 +1047,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: gather the draft-vocabulary output rows (LLAMA_DRAFT_VOCAB, draft models only)
+    void load_tensors_draft_vocab();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
