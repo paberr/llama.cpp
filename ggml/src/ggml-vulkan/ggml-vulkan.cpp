@@ -3651,6 +3651,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,        "dsv4_hc_pre_f32",        dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 0 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_gated_f32,  "dsv4_hc_pre_gated_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256, 1 }, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_moe_wsum_f32,           "moe_wsum_f32",           moe_wsum_f32_len,     moe_wsum_f32_data,     "main", 3, sizeof(vk_op_moe_wsum_push_constants),     {256, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
 
@@ -7447,6 +7448,35 @@ void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subctx, con
     init_pushconst_tensor_offsets(ctx, pc, x, residual, p_src, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+// MUL(x, w) + expert views + ADD chain (ggml_vk_can_fuse_moe_wsum): dst = sum_e x[:, e, :] * w[e, :]
+static void ggml_vk_moe_wsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * mul, ggml_tensor * dst) {
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * w = mul->src[1];
+
+    vk_pipeline pipeline = ctx->device->pipeline_moe_wsum_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    const uint32_t ne0      = (uint32_t)x->ne[0];
+    const uint32_t n_tokens = (uint32_t)x->ne[2];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x,   true);
+    const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w,   true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    vk_op_moe_wsum_push_constants pc = {
+        ne0, (uint32_t)x->ne[1], n_tokens,
+        ggml_vk_nb_elem(x, 1), ggml_vk_nb_elem(x, 2),
+        ggml_vk_nb_elem(w, 1), ggml_vk_nb_elem(w, 2),
+        ggml_vk_nb_elem(dst, 1),
+        0, 0, 0,
+    };
+    init_pushconst_tensor_offsets(ctx, pc, x, w, nullptr, nullptr, dst);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, w_buf, d_buf }, pc, { ne0, n_tokens, 1 });
 }
 
 void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -12756,7 +12786,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_moe_wsum) {
+            ggml_vk_moe_wsum(ctx, compute_ctx, node, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -13873,6 +13905,62 @@ static bool ggml_vk_can_fuse_unary_mul_pair(const struct ggml_cgraph * cgraph, i
     const int           outputs[] = { node_idx + 1 };
     return ggml_can_fuse_subgraph(cgraph, node_idx, 2, ops, outputs, 1) &&
            ggml_vk_can_fuse_unary_mul(cgraph, node_idx, node_idx + 1);
+}
+
+// MoE output weighting and expert sum (llm_graph build_moe_ffn): MUL(experts [ne0, n, T], weights [1, n, T]), then n
+// views of the product (expert e at offset e*nb1, [ne0, T]) and the ADD chain v0 + v1 + ... + v(n-1), all contiguous in
+// the graph. Returns the number of nodes after the MUL that one moe_wsum dispatch replaces, or 0.
+static int ggml_vk_can_fuse_moe_wsum(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    if (mul->op != GGML_OP_MUL) {
+        return 0;
+    }
+    const ggml_tensor * x = mul->src[0];
+    const ggml_tensor * w = mul->src[1];
+    if (!x || !w || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const int64_t ne0 = x->ne[0];
+    const int64_t n   = x->ne[1];
+    const int64_t nt  = x->ne[2];
+    if (n < 2 || n > 16 || x->ne[3] != 1 || nt > 65535 || x->nb[0] != sizeof(float) ||
+        w->ne[0] != 1 || w->ne[1] != n || w->ne[2] != nt || w->ne[3] != 1 ||
+        !ggml_are_same_shape(mul, x) || !ggml_is_contiguous(mul) || (mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const int n_fused = 2 * (int) n - 1;
+    if (node_idx + n_fused >= cgraph->n_nodes || ggml_node_get_use_count(cgraph, node_idx) != n) {
+        return 0;
+    }
+    const ggml_tensor * views[16] = {};
+    for (int k = 0; k < n; ++k) {
+        const int vi = node_idx + 1 + k;
+        const ggml_tensor * v = cgraph->nodes[vi];
+        if (v->op != GGML_OP_VIEW || v->view_src != mul || v->src[0] != mul || v->type != GGML_TYPE_F32 ||
+            v->view_offs % mul->nb[1] != 0 || v->ne[0] != ne0 || v->ne[1] != nt || v->ne[2] != 1 || v->ne[3] != 1 ||
+            v->nb[1] != mul->nb[2] || (v->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, vi) != 1) {
+            return 0;
+        }
+        const size_t e = v->view_offs / mul->nb[1];
+        if (e >= (size_t) n || views[e]) {
+            return 0;
+        }
+        views[e] = v;
+    }
+    const ggml_tensor * prev = views[0];
+    for (int e = 1; e < n; ++e) {
+        const int ai = node_idx + (int) n + e;
+        const ggml_tensor * a = cgraph->nodes[ai];
+        if (a->op != GGML_OP_ADD || a->type != GGML_TYPE_F32 || a->src[0] != prev || a->src[1] != views[e] ||
+            a->ne[0] != ne0 || a->ne[1] != nt || a->ne[2] != 1 || a->ne[3] != 1 || a->nb[0] != sizeof(float)) {
+            return 0;
+        }
+        if (e < n - 1 && ((a->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, ai) != 1)) {
+            return 0;
+        }
+        prev = a;
+    }
+    return n_fused;
 }
 
 static bool ggml_vk_can_fuse_hc_post_gate(const struct ggml_cgraph * cgraph, int node_idx) {
@@ -15073,12 +15161,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        bool op_srcs_fused_elementwise[32];
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
+        ctx->fused_moe_wsum = false;
         ctx->fused_mmv_scale_silu = false;
         ctx->fused_mmv_hc_pre = false;
         ctx->fused_mmv_hc_post = false;
@@ -15086,10 +15175,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            int moe_wsum_n = 0;
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if ((moe_wsum_n = ggml_vk_can_fuse_moe_wsum(cgraph, i)) > 0) {
+                ctx->num_additional_fused_ops = moe_wsum_n;
+                ctx->fused_moe_wsum = true;
+                fusion_string = "MOE_WSUM";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse_mmv_hc_post(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 4;
                 ctx->fused_mmv_hc_post = true;
@@ -15348,6 +15443,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
+                ctx->fused_moe_wsum = false;
                 ctx->fused_mmv_scale_silu = false;
                 ctx->fused_mmv_hc_pre = false;
                 ctx->fused_mmv_hc_post = false;
@@ -15475,6 +15571,35 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             params->add_alloc_dep(params->user_data, cat->src[0], graph->nodes[last]);
             params->add_alloc_dep(params->user_data, cat->src[1], graph->nodes[last]);
+        }
+    }
+
+    // MOE_WSUM reads the expert outputs and weights while it writes the end of the ADD chain: keep both alive until then,
+    // so the allocator cannot place the sum (or an intermediate ADD) in their memory.
+    if (params && params->add_alloc_dep && !ctx->device->disable_fusion) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * mul = graph->nodes[i];
+            if (mul->op != GGML_OP_MUL || !mul->src[0] || !mul->src[1] || mul->src[1]->ne[0] != 1 || mul->src[0]->ne[1] < 2 ||
+                mul->src[1]->ne[1] != mul->src[0]->ne[1]) {
+                continue;
+            }
+            // follow the chain: views of mul, then ADDs whose src[0] is the previous link
+            ggml_tensor * last = nullptr;
+            ggml_tensor * prev = nullptr;
+            for (int j = i + 1; j < graph->n_nodes && j < i + 64; ++j) {
+                ggml_tensor * a = graph->nodes[j];
+                if (a->op != GGML_OP_ADD || !a->src[1] || a->src[1]->view_src != mul) {
+                    continue;
+                }
+                if ((prev == nullptr && a->src[0]->view_src == mul) || (prev != nullptr && a->src[0] == prev)) {
+                    prev = a;
+                    last = a;
+                }
+            }
+            if (last) {
+                params->add_alloc_dep(params->user_data, mul->src[0], last);
+                params->add_alloc_dep(params->user_data, mul->src[1], last);
+            }
         }
     }
 
