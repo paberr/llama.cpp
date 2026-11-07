@@ -1877,6 +1877,19 @@ private:
             }
         }
 
+        // the prompt cache can hold a much longer match than the selected slot, e.g. when a conversation is resumed
+        // after another client used the slot: look it up instead of re-processing the difference
+        if (ret != nullptr && !update_cache && prompt_cache && !ret->is_processing()) {
+            const size_t lcp_slot  = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const size_t lcp_cache = prompt_cache->best_common_prefix(task.tokens);
+
+            if (lcp_cache > lcp_slot + 256) {
+                SLT_INF(*ret, "prompt cache has a longer match (%zu vs %zu tokens in the slot)\n", lcp_cache, lcp_slot);
+
+                update_cache = true;
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
