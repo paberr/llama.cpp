@@ -11865,6 +11865,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 1024, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
+    // Vulkan cm1 MUL_MAT_ID: raw-staged IQ3_S rows (odd superblock count per row = 2-byte misaligned chunks,
+    // partial row tiles) and the striped output mapping with sparse, full and partial expert tiles
+    for (ggml_type t : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 16, 4, false, 200, 64, 768));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 4, 2, false, 200, 300, 768));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 64, 10, false, 640, 512, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 8, 3, false, 2560, 400, 640));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
     // multiple blocks per row: exercises the block-stride loop and the
@@ -13231,6 +13239,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+
+    // Qwen3.8-Flash-Next MoE (512 experts, 10 used, FF 640, d 2560): gate/up IQ3_S, down IQ4_NL
+    for (int bs : {512, 1024, 2048, 4096}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, bs, 2560, {1, 1}, {1, 1}));
     }
 
     // qwen3-30b-a3b
