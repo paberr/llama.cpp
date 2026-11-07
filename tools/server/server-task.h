@@ -749,6 +749,9 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // longest prefix any cached prompt shares with tokens_new
+    size_t best_common_prefix(const server_tokens & tokens_new) const;
+
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
