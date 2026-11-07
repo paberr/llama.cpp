@@ -76,6 +76,7 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool cache_pin       = false; // keep this prompt in the prompt cache for good (never evicted, restored as a copy)
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -718,6 +719,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // pinned entries are never evicted and are restored as copies (request field "cache_pin")
+    bool pinned = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -747,7 +751,10 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool pinned = false);
+
+    // remove the oldest entry that is not pinned, false if there is none
+    bool evict_oldest();
 
     // longest prefix any cached prompt shares with tokens_new
     size_t best_common_prefix(const server_tokens & tokens_new) const;

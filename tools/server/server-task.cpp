@@ -1753,14 +1753,32 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+bool server_prompt_cache::evict_oldest() {
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (!it->pinned) {
+            SRV_WRN(" - removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
+            states.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool pinned) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            if (pinned && it->prompt.tokens.size() == prompt.tokens.size()) {
+                SRV_TRC("%s", " - prompt is already in the cache, pinning it\n");
+                it->pinned = true;
+                return nullptr;
+            }
+            if (!pinned) {
+                SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+                return nullptr;
+            }
         }
     }
 
@@ -1783,7 +1801,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->pinned) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1794,11 +1812,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+        while (size() + state_size_new > limit_size) {
+            SRV_WRN("%s", " - making room for prompt cache entry\n");
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break;
+            }
         }
     }
 
@@ -1830,6 +1849,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.pinned =*/ pinned,
     });
 
     return &states.back();
@@ -1873,7 +1893,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // system prompt as a long cached one): restore a copy and keep the cached entry, so the long
         // conversation stays resumable. memory that cannot be rolled back (recurrent/SWA) needs a
         // checkpoint inside the shared prefix, otherwise the copy would be re-processed anyway
-        const bool copy = f_keep_cur < 0.5f;
+        const bool copy = f_keep_cur < 0.5f || it->pinned;
         if (copy) {
             bool usable = it->prompt.checkpoints.empty();
             for (const auto & ckpt : it->prompt.checkpoints) {
@@ -1956,10 +1976,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        while (size() > limit_size) {
+            SRV_WRN("%s", " - cache size limit reached\n");
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break;
+            }
         }
     }
 
@@ -1970,11 +1992,12 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+        while (n_tokens() > limit_tokens_cur) {
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached\n", limit_tokens, limit_tokens_cur);
 
-            states.pop_front();
+            if (!evict_oldest()) {
+                break;
+            }
         }
     }
 
@@ -1982,7 +2005,8 @@ void server_prompt_cache::update() {
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0),
+                state.pinned ? " (pinned)" : "");
     }
 }
