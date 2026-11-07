@@ -340,7 +340,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, bool pinned = false) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -353,7 +353,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, pinned);
         if (cur == nullptr) {
             return false;
         }
@@ -2414,6 +2414,14 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // "cache_pin": keep this prompt in the prompt cache for good
+        if (prompt_cache && slot.task->params.cache_pin && slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+            if (slot.prompt_save(*prompt_cache, /* pinned */ true)) {
+                SLT_INF(slot, "pinned prompt with %d tokens in the prompt cache\n", slot.prompt.n_tokens());
+            }
+            prompt_cache->update();
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;

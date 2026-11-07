@@ -33,6 +33,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_bool("cache_pin", params.cache_pin))
+        ->set_desc("Keep the processed prompt in the RAM prompt cache for good: the entry is never evicted and is restored as a copy, so later requests that share its prefix (e.g. the same system prompt and tools) never process it again. Use with a short request (max_tokens 1) to warm a prefix"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 
