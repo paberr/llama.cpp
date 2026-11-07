@@ -11859,11 +11859,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
     // and 1024 at the LLAMA_MAX_EXPERTS limit
-    for (int n : {1, 5, 64, 300}) {
+    // 9-25 tokens take the mat-vec path with 512 experts (Vulkan), 26+ the matmul path
+    for (int n : {1, 5, 9, 16, 25, 26, 64, 300}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32,  512, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32,  512, 10, false, 256, n, 128));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 1024, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32,  512, 10, false, 256, n, 128));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32,  512, 10, false, 256, n, 128));
     }
     // Vulkan cm1 MUL_MAT_ID: raw-staged IQ3_S rows (odd superblock count per row = 2-byte misaligned chunks,
     // partial row tiles) and the striped output mapping with sparse, full and partial expert tiles
@@ -11951,6 +11954,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 4, 4, false, 512, 64, 256, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1, 0, false, true));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
+    // many experts, 9-25 tokens: fused mat-vec epilogues on the Vulkan mat-vec path
+    for (int n : {9, 16, 25}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 128, n, 256, 1, true));
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 256, n, 128, 1, true));
+    }
 
     for (int bs : {1, 4, 512}) {
         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
@@ -13242,7 +13250,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Qwen3.8-Flash-Next MoE (512 experts, 10 used, FF 640, d 2560): gate/up IQ3_S, down IQ4_NL
-    for (int bs : {512, 1024, 2048, 4096}) {
+    for (int bs : {8, 9, 16, 24, 32, 512, 1024, 2048, 4096}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 640, bs, 2560, {1, 1}, {1, 1}));
