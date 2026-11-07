@@ -8156,7 +8156,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
 static bool ggml_vk_use_mul_mat_vec_id(const ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * ids = dst->src[2];
-    return ids->ne[1] <= 8 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_as     = src0->ne[2];
+    // The mat-vec path reads each selected expert once per token. With many experts the tokens of a small batch
+    // rarely share one, so it stays faster than the matmul path up to ~0.5 tokens per expert on average
+    // (512 experts x 10 used, gfx1151: IQ3_S 9 tokens 853 -> 265 us, IQ4_NL 460 -> 348 us; matmul wins from ~32 tokens).
+    const bool few_tokens = n_tokens <= 8 || (n_tokens <= 32 && 2 * n_tokens * n_used <= n_as);
+    return few_tokens && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
 }
 
 bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int node_idx) {
