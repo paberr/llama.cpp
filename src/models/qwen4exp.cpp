@@ -641,7 +641,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0)); // [n_embd, hc, n_tokens]
+    // one [2*n_embd, hc*n_tokens] matmul: as a 3D batch the backends run one mat-vec per token and re-read the weight
+    // n_tokens times (MTP prompt pass: 53 % of the draft graph at a 2048-token ubatch)
+    ggml_tensor * eh_in  = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens], contiguous
+    ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens));
+    res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens); // [n_embd, hc, n_tokens]
     cb(res_hc, "mtp_eh_proj", il);
 
     hc_mix attn_mix = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, il);
