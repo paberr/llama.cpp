@@ -8380,7 +8380,22 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // Sparse mask hint with many query rows (prompt processing over a top-k selection, e.g. Qwen QSA): every row has its
+    // own finite set, so run each row like a decode row (gqa grouping) and let the sparse path gather only that set.
+    // Same eligibility as use_sparse below, which needs gqa_ratio > 1.
+    bool sparse_rows = false;
+    {
+        static const bool disable_sparse_rows = getenv("GGML_VK_FA_SPARSE_ROWS_DISABLE") != nullptr;
+        const int32_t n_kv_max_hint = mask ? ggml_get_op_params_i32(dst, 4) : 0;
+        const float * fa_params = (const float *) dst->op_params;
+        const bool raw_f16 = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
+        sparse_rows = !disable_sparse_rows && N > 8 && n_kv_max_hint > 0 &&
+                      fa_params[1] == 0.0f && fa_params[2] == 0.0f &&
+                      tuning_params.path != FA_COOPMAT2 && nem0 == KV &&
+                      (int64_t)KV >= std::max<int64_t>(4096, (raw_f16 ? 2 : 16) * (int64_t)n_kv_max_hint);
+    }
+
+    if ((N <= 8 || sparse_rows) && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
