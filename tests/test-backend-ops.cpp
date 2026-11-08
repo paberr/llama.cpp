@@ -12985,6 +12985,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // many-token tiles (coopmat path on Vulkan): ragged token and key counts, model head count
+    for (auto [kv, bs] : { std::pair{17, 33}, std::pair{1000, 100}, std::pair{4160, 2048}, std::pair{65, 127} }) {
+        for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, type_K));
+        }
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 2, 1, GGML_TYPE_F32));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13020,6 +13028,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next pooled indexer prefill.
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 4224, 2048, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 16960, 2048, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 16960, 512, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 16960, 4, 1, 1, GGML_TYPE_F32));
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

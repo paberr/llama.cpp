@@ -3709,6 +3709,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
         ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), lightning_indexer_f32_len, lightning_indexer_f32_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true);
     }
+#if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // the coopmat indexer multiplies 16x16x16 f16 blocks into f32 and needs subgroups of exactly 32
+    if (device->coopmat_support && device->coopmat_support_16x16x16_f32acc && device->subgroup_require_full_support &&
+        device->subgroup_size_control && device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32 &&
+        getenv("GGML_VK_LI_CM1_DISABLE") == nullptr) {
+        for (ggml_type k_type : lightning_indexer_k_types) {
+            const std::string name = "lightning_indexer_cm1_" + std::string(ggml_type_name(k_type)) + "_k_f32";
+            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm1_f32[k_type], name.c_str(), lightning_indexer_f32_cm1_len, lightning_indexer_f32_cm1_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type)}, 1, true, true, 32);
+        }
+    }
+#endif
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
@@ -10522,17 +10533,30 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, w, dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
     const uint32_t n_kv      = k->ne[2];
     const uint32_t n_heads   = q->ne[1];
     const uint32_t n_tokens  = q->ne[2];
     const uint32_t n_streams = q->ne[3];
     const uint32_t n_masks   = m->ne[3];
 
-    // one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp
-    const uint32_t n_tiles_kv = CEIL_DIV(n_kv, 64);
-    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, 8);
+    // one workgroup per tile of 64 keys and 8 tokens, see lightning_indexer.comp;
+    // for many tokens the coopmat variant takes tiles of 128 keys and 64 tokens
+    uint32_t tile_t = 8;
+    uint32_t tile_k = 64;
+    {
+        static const uint32_t cm1_min_tokens = getenv("GGML_VK_LI_CM1_MIN") ? (uint32_t) atoi(getenv("GGML_VK_LI_CM1_MIN")) : 32;
+        vk_pipeline cm1 = ctx->device->pipeline_lightning_indexer_cm1_f32[k->type];
+        if (cm1 && n_tokens >= cm1_min_tokens) {
+            pipeline = cm1;
+            tile_t = 64;
+            tile_k = 128;
+        }
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t n_tiles_kv = CEIL_DIV(n_kv, tile_k);
+    const uint32_t n_tiles_t  = CEIL_DIV(n_tokens, tile_t);
 
     // q, w and dst are f32 and m is f16, so their strides are passed in elements;
     // k may be quantized, so its strides stay in bytes
