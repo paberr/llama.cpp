@@ -11754,7 +11754,11 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
 
     // tournament path is faster where it fits; use radix-select only past its k limit
     const uint32_t k_min_pipeline = std::max((uint32_t) log2f(float(k)) + 1, ctx->device->subgroup_size_log2);
-    if (k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr) {
+    // large k over long rows (QSA pool selection at depth): the tournament needs several passes of
+    // k-wide sorts, radix-select reads each row a few times (16960 cols, k 512: 4.15 -> 1.60 ms per 2048 rows;
+    // the radix path has a ~1 ms floor, so short rows stay on the tournament)
+    const bool prefer_radix = ncols >= 4096 && k >= 256;
+    if (k_min_pipeline >= num_topk_pipelines || ctx->device->pipeline_topk_f32[k_min_pipeline] == nullptr || prefer_radix) {
         vk_pipeline pipeline = ctx->device->pipeline_topk_radix_f32;
         GGML_ASSERT(pipeline != nullptr);
 
