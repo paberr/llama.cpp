@@ -5364,6 +5364,95 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// GET_ROWS (state gather) -> CPY (extra states) -> GATED_DELTA_NET, in the order build_rs emits them.
+// Backends that skip the gather and read the state row at the gdn must notice the CPY in between: here the
+// selected row is moved by the CPY, as when the recurrent cache swaps cells of several sequences.
+struct test_gated_delta_net_state_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const bool    extra; // false: the extra-states copy is empty (single-sequence ubatch, may be fused)
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, n_seq_tokens, extra);
+    }
+
+    test_gated_delta_net_state_gather(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1, bool extra = true)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), extra(extra) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size;
+        const int64_t H = head_count;
+        const int64_t D = S * S * H;
+        const int64_t n_rs = extra ? 2 : 1;
+
+        // cache rows 0..n_rs-1 hold [ubatch sequence ; extra states], copies come from state_copy
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 4);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * state_copy      = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_rs);
+        ggml_tensor * state_copy_main = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(state_copy,      "state_copy");
+        ggml_set_name(state_copy_main, "state_copy_main");
+
+        ggml_tensor * states_all = ggml_get_rows(ctx, cache, state_copy);
+        ggml_tensor * s0         = ggml_get_rows(ctx, cache, state_copy_main);
+        ggml_set_name(s0, "s0");
+        if (gf) {
+            ggml_build_forward_expand(gf, s0);
+        }
+        ggml_tensor * extra_cpy = ggml_cpy(ctx,
+                ggml_view_2d(ctx, states_all, D, n_rs - 1, states_all->nb[1], states_all->nb[1]),
+                ggml_view_2d(ctx, cache,      D, n_rs - 1, cache->nb[1],      cache->nb[1]));
+        ggml_set_name(extra_cpy, "extra_cpy");
+        if (gf) {
+            ggml_build_forward_expand(gf, extra_cpy);
+        }
+
+        ggml_tensor * q    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, 1), 1e-6f);
+        ggml_tensor * k    = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, 1), 1e-6f);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n_seq_tokens, 1);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, 1);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, 1);
+        ggml_set_name(v,    "v");
+        ggml_set_name(g,    "g");
+        ggml_set_name(beta, "beta");
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, s0, S, S, H, 1);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        // compared element-wise; the gdn itself must not be the graph output (fusions skip outputs)
+        return ggml_scale(ctx, out, 1.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "state_copy") == 0) {
+                // the sequence's state moved from row 1 to row 0, the former row 0 moves to row 1
+                const int32_t ids[2] = { 1, 0 };
+                ggml_backend_tensor_set(t, ids, 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "state_copy_main") == 0) {
+                const int32_t id = extra ? 1 : 2;
+                ggml_backend_tensor_set(t, &id, 0, sizeof(id));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12953,6 +13042,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
+
+    // state gather -> extra-states cpy -> gdn (gather fusion must respect the cpy)
+    for (bool extra : { false, true }) {
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(4, 32,  1, extra));
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(4, 128, 3, extra));
+    }
 
     // gdn + cache cpy fusion (K > 1)
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));

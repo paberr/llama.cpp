@@ -4075,9 +4075,10 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // try and fuse nodes and return the number of nodes to skip
 // A GET_ROWS that gathers the recurrent state of a single sequence for one GATED_DELTA_NET (decode and short
 // verify batches) is skipped: the gdn kernel reads s0 from the cache row through the ids instead, which saves a full
-// read + write of the state. Its other users may only be views and empty copies (the extra-states copy of a
-// single-sequence ubatch is empty). The cache row may be updated in place: each gdn thread reads its part of s0
-// before it writes the same elements (gated_delta_net.cu).
+// read + write of the state. Its other users may only be views and empty copies. No node between the GET_ROWS and
+// the gdn may write the cache: the read moves to the gdn, and the extra-states copy of build_rs sits in between (empty
+// for a plain single-sequence ubatch, but with several sequences it can overwrite the selected row). The cache row may
+// be updated in place: each gdn thread reads its part of s0 before it writes the same elements (gated_delta_net.cu).
 static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * gr = cgraph->nodes[i];
     if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
@@ -4087,9 +4088,13 @@ static bool ggml_cuda_try_defer_gdn_state_gather(ggml_backend_cuda_context * cud
         return false;
     }
 
+    const ggml_tensor * states_root = gr->src[0]->view_src ? gr->src[0]->view_src : gr->src[0];
     const ggml_tensor * gdn = nullptr;
     for (int j = i + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
+        if (gdn == nullptr && !ggml_is_empty(n) && !ggml_cuda_is_view_or_noop(n) && (n == states_root || n->view_src == states_root)) {
+            return false; // writes the cache before the gdn would read it
+        }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
             const ggml_tensor * src = n->src[s];
             if (src == nullptr || (src != gr && src->view_src != gr)) {

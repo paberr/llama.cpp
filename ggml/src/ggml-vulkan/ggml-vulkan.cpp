@@ -14996,6 +14996,23 @@ static void ggml_vk_find_gdn_fusions(ggml_backend_vk_context * ctx, const ggml_c
             for (size_t u = 0; ok && u < it->second.size(); ++u) {
                 ok = it->second[u].first == gdn && it->second[u].second == 5;
             }
+            // The fused gdn reads the cache row at the gdn instead of at the GET_ROWS, so no node in between may
+            // write the cache. build_rs puts the extra-states CPY there: it is empty for a plain single-sequence
+            // ubatch, but with several sequences (cell moves, n_rs > n_seqs) it can overwrite the row the ids select.
+            const ggml_tensor * states_root = gr->src[0]->view_src ? gr->src[0]->view_src : gr->src[0];
+            int gr_idx = -1;
+            for (int k = i - 1; ok && k >= 0; --k) {
+                if (cgraph->nodes[k] == gr) {
+                    gr_idx = k;
+                    break;
+                }
+            }
+            ok = ok && gr_idx >= 0;
+            for (int k = gr_idx + 1; ok && k < i; ++k) {
+                const ggml_tensor * m = cgraph->nodes[k];
+                ok = ggml_is_empty(m) || ggml_vk_is_empty(const_cast<ggml_tensor *>(m)) ||
+                     (m != states_root && m->view_src != states_root);
+            }
             if (ok) {
                 f.states = gr->src[0];
                 f.ids    = gr->src[1];
