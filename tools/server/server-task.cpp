@@ -1764,15 +1764,56 @@ bool server_prompt_cache::evict_oldest() {
     return false;
 }
 
+size_t server_prompt_cache::size_pinned() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (state.pinned) {
+            res += state.size();
+        }
+    }
+
+    return res;
+}
+
+bool server_prompt_cache::make_room_pinned(size_t size_new, const server_prompt_cache_state * keep) {
+    if (size_new > limit_pinned) {
+        return false;
+    }
+    while (size_pinned() + size_new > limit_pinned) {
+        auto it = states.begin();
+        while (it != states.end() && (!it->pinned || &*it == keep)) {
+            ++it;
+        }
+        if (it == states.end()) {
+            return false;
+        }
+        SRV_WRN(" - pinned budget reached, removing oldest pinned entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
+        states.erase(it);
+    }
+    return true;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool pinned) {
+    if (pinned && limit_pinned == 0) {
+        pinned = false; // pinning disabled (--cache-pin-ram 0): cache it like any other prompt
+    }
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             if (pinned && it->prompt.tokens.size() == prompt.tokens.size()) {
-                SRV_TRC("%s", " - prompt is already in the cache, pinning it\n");
-                it->pinned = true;
+                if (!it->pinned) {
+                    if (!make_room_pinned(it->size(), &*it)) {
+                        SRV_WRN(" - prompt state size %.3f MiB exceeds the pinned budget %.3f MiB, not pinning\n",
+                                it->size() / (1024.0 * 1024.0), limit_pinned / (1024.0 * 1024.0));
+                        return nullptr;
+                    }
+                    SRV_TRC("%s", " - prompt is already in the cache, pinning it\n");
+                    it->pinned = true;
+                }
                 return nullptr;
             }
             if (!pinned) {
@@ -1797,17 +1838,28 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    if (pinned && state_size_new > limit_pinned) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds the pinned budget %.3f MiB, not pinning\n",
+                state_size_new / (1024.0 * 1024.0), limit_pinned / (1024.0 * 1024.0));
+        pinned = false;
+    }
+
     // remove any cached prompts that are fully contained in the current prompt
+    // (a pinned prompt is only replaced by a pinned one that extends it)
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size() && !it->pinned) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+        if (len == (int) it->prompt.tokens.size() && (!it->pinned || pinned)) {
+            SRV_TRC(" - removing obsolete cached prompt with length %d%s\n", len, it->pinned ? " (pinned)" : "");
 
             it = states.erase(it);
         } else {
             ++it;
         }
+    }
+
+    if (pinned && !make_room_pinned(state_size_new)) {
+        pinned = false;
     }
 
     if (limit_size > 0) {
@@ -1818,6 +1870,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             if (!evict_oldest()) {
                 break;
             }
+        }
+
+        // only pinned entries are left and the new one does not fit next to them
+        if (size() + state_size_new > limit_size) {
+            SRV_WRN(" - prompt state size %.3f MiB does not fit next to %.3f MiB of pinned entries, skipping\n",
+                    state_size_new / (1024.0 * 1024.0), size_pinned() / (1024.0 * 1024.0));
+            return nullptr;
         }
     }
 
@@ -1832,6 +1891,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
         limit_size = std::max<size_t>(1, 0.4*size());
+        limit_pinned = std::min(limit_pinned, limit_size);
 
         SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
 
@@ -1975,6 +2035,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    // the pinned budget can shrink (allocation failure), so it is enforced here too
+    make_room_pinned(0);
+
     if (limit_size > 0) {
         while (size() > limit_size) {
             SRV_WRN("%s", " - cache size limit reached\n");

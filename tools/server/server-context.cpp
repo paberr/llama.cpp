@@ -1599,7 +1599,10 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_pin_mib);
+            if (prompt_cache->limit_pinned > 0) {
+                SRV_INF("prompt pinning (\"cache_pin\") enabled, budget: %.0f MiB\n", prompt_cache->limit_pinned / (1024.0 * 1024.0));
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -2414,8 +2417,9 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
-        // "cache_pin": keep this prompt in the prompt cache for good
-        if (prompt_cache && slot.task->params.cache_pin && slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+        // "cache_pin": keep this prompt in the prompt cache (within the --cache-pin-ram budget, ignored when 0)
+        if (prompt_cache && prompt_cache->limit_pinned > 0 &&
+            slot.task->params.cache_pin && slot.task->params.cache_prompt && !slot.task->is_stateless()) {
             if (slot.prompt_save(*prompt_cache, /* pinned */ true)) {
                 SLT_INF(slot, "pinned prompt with %d tokens in the prompt cache\n", slot.prompt.n_tokens());
             }

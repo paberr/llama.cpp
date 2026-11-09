@@ -1672,6 +1672,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-pin-ram"}, "N",
+        string_format("part of --cache-ram in MiB that requests may pin with the \"cache_pin\" field; pinned prompts are "
+            "never evicted by other prompts, the oldest pinned one makes way when the budget is full "
+            "(default: %d, 0 - ignore \"cache_pin\")", params.cache_pin_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --cache-pin-ram must be >= 0\n");
+            }
+            params.cache_pin_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_PIN_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

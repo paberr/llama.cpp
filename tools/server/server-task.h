@@ -734,9 +734,13 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, int32_t limit_pinned_mib = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->limit_pinned = 1024ull*1024ull*(limit_pinned_mib < 0 ? 0 : limit_pinned_mib);
+        if (limit_size > 0) {
+            this->limit_pinned = std::min(this->limit_pinned, limit_size);
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -747,7 +751,12 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // in bytes, budget for pinned entries (part of limit_size), 0 = pinning disabled
+    size_t limit_pinned = 0;
+
     size_t size() const;
+
+    size_t size_pinned() const;
 
     size_t n_tokens() const;
 
@@ -755,6 +764,9 @@ struct server_prompt_cache {
 
     // remove the oldest entry that is not pinned, false if there is none
     bool evict_oldest();
+
+    // remove the oldest pinned entries other than keep until size_new more pinned bytes fit, false if they cannot
+    bool make_room_pinned(size_t size_new, const server_prompt_cache_state * keep = nullptr);
 
     // longest prefix any cached prompt shares with tokens_new
     size_t best_common_prefix(const server_tokens & tokens_new) const;
